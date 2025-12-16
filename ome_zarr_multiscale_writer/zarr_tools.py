@@ -1,0 +1,619 @@
+import os, concurrent.futures
+from pathlib import Path
+import math
+import threading, queue
+import numpy as np
+import zarr
+from zarr.codecs import BloscCodec, BloscShuffle, ShardingCodec
+from dataclasses import dataclass
+from typing import Tuple
+from enum import Enum
+
+
+import multiprocessing as mp
+from multiprocessing import shared_memory
+
+# Local imports
+from helpers import *
+
+VERBOSE = True
+STORE_PATH = "volume.ome.zarr"
+
+# at top-level (after imports)
+blosc_threads = max(1, os.cpu_count() // 2)
+try:
+    import blosc2            # zarr v3 uses python-blosc2
+    blosc2.set_nthreads(blosc_threads)  # e.g., half your cores
+except Exception:
+    pass
+
+@dataclass
+class ChunkSpec:
+    z: int = 8
+    y: int = 512
+    x: int = 512
+
+@dataclass
+class PyramidSpec:
+    z_size_estimate: int   # upper bound; we trim on close()
+    y: int
+    x: int
+    levels: int
+
+class FlushPad(Enum):
+    DUPLICATE_LAST = "duplicate_last"  # repeat last plane to fill the chunk
+    ZEROS = "zeros"                    # pad with zeros
+    DROP = "drop"                      # do not flush the tail (you'll lose last planes)
+
+@dataclass
+class ChunkScheme:
+    """
+    Per-level chunking policy that evolves from base -> target as levels increase.
+    - base applies at level 0 (e.g., z=8, y=512, x=512)
+    - at each level l, we:
+        zc = min(target.z, base.z * 2**l)         # z chunk grows toward target
+        yc = max(target.y, max(1, base.y // 2**l))# y/x chunks shrink toward target
+        xc = max(target.x, max(1, base.x // 2**l))
+    Then we clamp to the level's array shape.
+    """
+    base: Tuple[int, int, int] = (1, 1024, 1024)    # (z, y, x) at level 0
+    target: Tuple[int, int, int] = (64, 64, 64)   # desired asymptote
+
+    def chunks_for_level(self, level: int, zyx_level_shape: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        z_l, y_l, x_l = zyx_level_shape
+        bz, by, bx = self.base
+        tz, ty, tx = self.target
+
+        zc = min(tz, max(1, bz * (2 ** level)))
+        yc = max(ty, max(1, by // (2 ** level)))
+        xc = max(tx, max(1, bx // (2 ** level)))
+
+        # Clamp to the level's actual dimensions
+        return (min(zc, z_l), min(yc, y_l), min(xc, x_l))
+
+
+def _validate_divisible(chunks: Tuple[int,int,int], shards: Tuple[int,int,int]) -> bool:
+    return all(c % s == 0 for c, s in zip(chunks, shards))
+
+def _ensure_v2_compressor(compressor):
+    """
+    If a zarr v3 BloscCodec is passed (e.g., OME-Zarr 0.5 style), convert it to a
+    numcodecs.Blosc compatible with Zarr v2 (required for OME-Zarr 0.4).
+    Otherwise return compressor unchanged.
+    """
+
+    compressor_default = 'zstd'
+    clevel_default = 5
+    shuffle_default = 2
+
+    import numcodecs
+    from numcodecs import Blosc as BloscV2
+    numcodecs.blosc.set_nthreads(blosc_threads)
+    if BloscV2 is not None and isinstance(compressor, BloscCodec):
+        cname_attr = getattr(compressor, "cname", compressor_default)
+        # handle enum -> string
+        cname = getattr(cname_attr, "value", cname_attr)
+        if isinstance(cname, str):
+            cname = cname.lower()
+        clevel = int(getattr(compressor, "clevel", clevel_default))
+        shuffle_attr = getattr(compressor, "shuffle", shuffle_default)
+        # normalize shuffle to string key if enum
+        shuffle_str = getattr(shuffle_attr, "value", shuffle_attr)
+        if isinstance(shuffle_str, str):
+            shuffle_str = shuffle_str.lower()
+        shuffle_map = {
+            "noshuffle": 0,
+            "shuffle": 1,
+            "bitshuffle": 2,
+        }
+        shuffle_int = shuffle_map.get(shuffle_str, 1 if shuffle_str not in (0, 1, 2) else shuffle_str)
+        return BloscV2(cname=cname, clevel=clevel, shuffle=shuffle_int)
+
+
+def _coerce_shards(chunks: Tuple[int,int,int],
+                   desired: Tuple[int,int,int]) -> Tuple[int,int,int]:
+    """
+    Guaranteed-valid shards for Zarr v3: choose a divisor of each chunk dim,
+    <= desired, never 0.
+    """
+    out = []
+    for d, c in zip(desired, chunks):
+        d = int(d); c = int(c)
+        # clamp to chunk dim first
+        s = min(max(1, d), c)
+        # step down by gcd until it divides
+        g = math.gcd(s, c)
+        if g == 0:   # extremely defensive; shouldn't happen
+            g = 1
+        # If gcd(s, c) < s, try gcd(down, c) until it divides
+        while c % g != 0 and g > 1:
+            s = max(1, g)
+            g = math.gcd(s, c)
+        if c % g != 0:
+            # worst-case fallback: 1
+            g = 1
+        out.append(g)
+    return tuple(out)
+
+def pick_shards_for_level(
+    desired: Tuple[int,int,int] | None,
+    chunks: Tuple[int,int,int],
+    lvl_shape: Tuple[int,int,int],
+) -> Tuple[int,int,int] | None:
+    """
+    Zarr v3: choose a shard (super-chunk) shape so that
+      - shards[i] is a multiple of chunks[i] (>= 1 * chunks[i])
+      - shards[i] <= min(desired[i], lvl_shape[i])
+      - if desired is None -> no sharding (return None)
+    """
+    if desired is None:
+        return None
+    out = []
+    for d, c, n in zip(desired, chunks, lvl_shape):
+        c = int(c); n = int(n); d = int(d)
+        # upper bound can't exceed the level's extent
+        cap = min(d, n)
+        # at least one chunk per shard
+        k = max(1, cap // c)          # number of chunks per shard along this axis
+        s = k * c                      # snap to multiple of chunk
+        # (s <= cap <= n) and s % c == 0
+        out.append(s)
+    return tuple(out)
+
+
+
+# ---------- Zarr init (multiscales ome-zarr 0.4 and 0.5) ----------
+def init_ome_zarr(spec: PyramidSpec, path=STORE_PATH,
+                  chunk_scheme: ChunkScheme = ChunkScheme(),
+                  compressor=None,
+                  voxel_size=(1.0, 1.0, 1.0), unit="micrometer",
+                  translation: Tuple[int, int, int] = (0,0,0), # in units
+                  xy_levels: int = 0,
+                  shard_shape: Tuple[int,int,int] | None = None,
+                  ome_version: str = "0.5"):
+
+    # Map OME-NGFF version to Zarr store version
+    zarr_version = 2 if ome_version == "0.4" else 3
+    root = zarr.open_group(path, mode="a", zarr_version=zarr_version)
+    arrs = []
+    for l in range(spec.levels):
+        zf, yf, xf = level_factors(l, xy_levels)
+        z_l = ceil_div(spec.z_size_estimate, zf)
+        y_l = ceil_div(spec.y, yf)
+        x_l = ceil_div(spec.x, xf)
+        lvl_shape = (z_l, y_l, x_l)
+
+        chunks = chunk_scheme.chunks_for_level(l, lvl_shape)
+        # shards_l = pick_shards_for_level(shard_shape, chunks, lvl_shape)
+        shards_l = pick_shards_for_level(shard_shape, chunks, lvl_shape) if zarr_version == 3 else None
+
+        name = f"{l}"
+        if name in root:
+            a = root[name]
+            if a.shape != lvl_shape or a.dtype != np.uint16:
+                raise ValueError(f"Existing {name}: {a.shape}/{a.dtype} != {lvl_shape}/uint16")
+            if a.shape[0] < z_l:
+                a.resize((z_l, y_l, x_l))
+        elif zarr_version == 3:
+            kwargs = dict(name=name, shape=lvl_shape, chunks=chunks, dtype="uint16")
+            if compressor is not None:
+                # v3: list of codecs
+                kwargs["compressors"] = [compressor]
+            if shards_l is not None:
+                # v3: inner shard (must divide chunks)
+                kwargs["shards"] = shards_l
+            kwargs["dimension_names"] = ["z", "y", "x"]
+            if VERBOSE:
+                print(f"[init] creating {name}: shape={lvl_shape} chunks={chunks} shards={shards_l}")
+            a = root.create_array(**kwargs)
+        else:
+            # Zarr v2 path
+            if VERBOSE:
+                print(f"[init] creating {name} (Zarr v2): shape={lvl_shape} chunks={chunks}")
+            v2_comp = _ensure_v2_compressor(compressor)
+
+            # optional: dimension hint for some tools
+            try:
+                a.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
+            except Exception:
+                pass
+
+            # Work around AsyncGroup.create_array() not accepting `dimension_separator`
+            from zarr import create as zcreate
+            a = zcreate(
+                shape = lvl_shape,
+                chunks = chunks,
+                dtype = "uint16",
+                compressor = v2_comp,  # numcodecs codec
+                overwrite = False,
+                store = root.store,  # same store as the group
+                path = name,  # create under this group
+                zarr_format = 2,  # v2 array
+                dimension_separator = "/",  # nested directories in .zarray
+            )
+
+        arrs.append(a)
+
+    # OME attributes: multiscales with per-axis physical scales
+    dz, dy, dx = voxel_size
+    datasets = []
+    for l in range(spec.levels):
+        zf, yf, xf = level_factors(l, xy_levels)
+        s = [dz * zf, dy * yf, dx * xf]
+        datasets.append({
+            "path": f"{l}",
+            "coordinateTransformations": [
+                {"type": "scale", "scale": s},
+                {"type": "translation", "translation": list(translation)}
+                ],
+        })
+
+    axes = [
+        {"name": "z", "type": "space", "unit": unit},
+        {"name": "y", "type": "space", "unit": unit},
+        {"name": "x", "type": "space", "unit": unit},
+    ]
+    if ome_version == "0.5":
+        root.attrs["ome"] = {
+            "version": "0.5",
+            "multiscales": [{
+                "axes": axes,
+                "datasets": datasets,
+                "name": "image",
+                "type": "image",
+            }],
+        }
+    else:
+        # OME-Zarr 0.4 stores multiscales at top level
+        root.attrs["multiscales"] = [{
+            "version": "0.4",
+            "axes": axes,
+            "datasets": datasets,
+            "name": "image",
+        }]
+    return root, arrs
+
+
+# ---------- Live writer: true 3D decimation pipeline ----------
+class Live3DPyramidWriter:
+    """
+    Streams true-3D (2x in z,y,x) pyramid while you acquire slices.
+    Buffers complete Z-chunks per level and flushes only when chunks fill -> no read-modify-write.
+    """
+
+    def __init__(self, spec: PyramidSpec, voxel_size=(1.0, 1.0, 1.0), path=STORE_PATH, max_workers=None,
+                 chunk_scheme: ChunkScheme = ChunkScheme(), compressor=None,
+                 flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
+                 ingest_queue_size: int = 8,
+                 max_inflight_chunks: int | None = None,
+                 async_close: bool = True,
+                 shard_shape: Tuple[int, int, int] | None = None,
+                 translation: Tuple[int,int,int] = (0,0,0),
+                 ome_version: str = "0.5"):
+
+        self.spec = spec
+        self.chunk_scheme = chunk_scheme
+        self.flush_pad = flush_pad
+        self.xy_levels = compute_xy_only_levels(voxel_size)
+        self.max_workers = max_workers or min(8, os.cpu_count() or 4)
+        self.async_close = async_close
+        self.finalize_future = None
+
+        self.root, self.arrs = init_ome_zarr(
+            spec, path,
+            chunk_scheme=chunk_scheme, compressor=compressor,
+            voxel_size=voxel_size, xy_levels=self.xy_levels,
+            shard_shape=shard_shape, translation=translation,
+            ome_version=ome_version,
+        )
+
+        self.levels = spec.levels
+        self.z_counts = [0] * self.levels
+        self.buffers = [None] * self.levels
+        self.buf_fill = [0] * self.levels
+        self.buf_start = [0] * self.levels
+        self.zc = []
+        self.yx_shapes = []
+
+        for l in range(self.levels):
+            zf, yf, xf = level_factors(l, self.xy_levels)
+            z_l = ceil_div(self.spec.z_size_estimate, zf)
+            y_l = ceil_div(self.spec.y, yf)
+            x_l = ceil_div(self.spec.x, xf)
+            zc, yc, xc = self.chunk_scheme.chunks_for_level(l, (z_l, y_l, x_l))
+            self.zc.append(zc)
+            self.yx_shapes.append((y_l, x_l))
+
+        # Concurrency primitives
+        self.q = queue.Queue(maxsize=ingest_queue_size)
+        self.stop = threading.Event()
+        self.lock = threading.Lock()  # sequences z-indices & buffers (single writer to RAM)
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers
+        )
+        # Allow at most ~2 chunks per worker in flight (tweak as you like)
+        self.max_inflight_chunks = max_inflight_chunks or (self.max_workers * 40)
+        self._inflight_sem = threading.Semaphore(self.max_inflight_chunks)
+
+        self.worker = threading.Thread(target=self._consume, daemon=True)
+        self.worker.start()
+
+    # ---------- Public API ----------
+    def push_slice(self, slice_u16: np.ndarray):
+        assert slice_u16.dtype == np.uint16, "slice must be uint16"
+        assert slice_u16.shape == (self.spec.y, self.spec.x), \
+            f"got {slice_u16.shape}, expected {(self.spec.y, self.spec.x)}"
+        self.q.put(slice_u16, block=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def close(self):
+        if self.async_close:
+            self.close_async()    # Background finalize
+        else:
+            self.close_sync()     # synchronous finalize
+        print("Live3DPyramidWriter: finalized.")
+
+    def close_sync(self):
+        self.stop.set()
+        self.q.put(None)
+        self.worker.join()
+
+        with self.lock:
+            # flush odd Z-pair tails at levels >= 1
+            self._flush_pair_tails_all_the_way()
+
+            # Flush any partially filled chunks w/o RMW by padding to full chunk size
+            for l in range(self.levels):
+                if self.buffers[l] is not None and self.buf_fill[l] > 0:
+                    self._pad_and_flush_partial_chunk(l)
+
+        self.pool.shutdown(wait=True)
+
+        for l, a in enumerate(self.arrs):
+            a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
+
+    # inside class Live3DPyramidWriter
+
+    def close_async(self):
+        """
+        Start flushing/closing in a background thread and return a Future.
+        You can call future.result() later to wait for completion.
+        """
+        if getattr(self, "_finalize_future", None) is not None:
+            raise RuntimeError("close_async already called")
+        self._finalize_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.finalize_future = self._finalize_executor.submit(self._finalize)
+        return self.finalize_future
+
+    def _finalize(self):
+        self.stop.set()
+        self.q.put(None)
+        self.worker.join()
+
+        with self.lock:
+            self._flush_pair_tails_all_the_way()
+            for l in range(self.levels):
+                if self.buffers[l] is not None and self.buf_fill[l] > 0:
+                    self._pad_and_flush_partial_chunk(l)
+
+        # for fut in self.pending_futs:
+        #     fut.result()
+        self.pool.shutdown(wait=True)
+
+        for l, a in enumerate(self.arrs):
+            a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
+
+        # optional: mark completion for external watchers
+        try:
+            import pathlib
+            store_path = getattr(self.root.store, "path", None)
+            if store_path:
+                pathlib.Path(store_path, ".READY").write_text("ok")
+        except Exception:
+            pass
+
+    # ---------- Internals ----------
+
+    def _flush_pair_tails_all_the_way(self):
+        if not hasattr(self, "_pair_buf"):
+            return
+        changed = True
+        while changed:
+            changed = False
+            for lvl in range(max(1, self.xy_levels + 1), self.levels):  # start at first 3D level
+                buf = self._pair_buf[lvl]
+                if buf is None:
+                    continue
+                if self.flush_pad == FlushPad.DUPLICATE_LAST:
+                    tail = dsZ2_mean_uint16(buf, buf)
+                elif self.flush_pad == FlushPad.ZEROS:
+                    tail = dsZ2_mean_uint16(buf, np.zeros_like(buf, dtype=np.uint16))
+                else:  # DROP
+                    self._pair_buf[lvl] = None
+                    continue
+                self._pair_buf[lvl] = None
+                zL = self._reserve_z(lvl)
+                self._append_to_active_buffer(lvl, zL, tail)
+                self._emit_next(lvl + 1, ds2_mean_uint16(tail))
+                changed = True
+
+    def _consume(self):
+        while True:
+            item = self.q.get()
+            if item is None or self.stop.is_set():
+                break
+            self._ingest_raw(item)
+
+    def _reserve_z(self, level: int) -> int:
+        z = self.z_counts[level]
+        self.z_counts[level] += 1
+        return z
+
+    def _submit_write_chunk(self, level: int, z0: int, buf3d: np.ndarray):
+        # acquire *before* grabbing the lock (it’s called from inside-lock code now)
+
+        if self.max_inflight_chunks == 1 and self.max_inflight_chunks == 1: # Helps with single threaded debugging
+            self.arrs[level][z0:z0 + buf3d.shape[0], :, :] = buf3d
+        else:
+            self._inflight_sem.acquire()
+            fut = self.pool.submit(self._write_chunk_slice, self.arrs[level], z0, buf3d)
+            # Release the slot when done (and drop ref to the future immediately)
+            fut.add_done_callback(lambda _f: self._inflight_sem.release())
+
+    @staticmethod
+    def _write_chunk_slice(arr, z0, buf3d):
+        arr[z0:z0 + buf3d.shape[0], :, :] = buf3d  # contiguous, aligned write
+
+    def _ensure_active_buffer(self, level: int, start_z: int):
+        """Allocate active chunk buffer for a level if absent, starting at start_z."""
+        if self.buffers[level] is None:
+            zc = self.zc[level]
+            y_l, x_l = self.yx_shapes[level]
+            self.buffers[level] = np.empty((zc, y_l, x_l), dtype=np.uint16)
+            self.buf_fill[level] = 0
+            self.buf_start[level] = start_z
+
+    def _append_to_active_buffer(self, level: int, z_index: int, plane: np.ndarray):
+        """Append plane into the active buffer; flush when full."""
+        zc = self.zc[level]
+        if self.buf_fill[level] == 0:
+            # Align start to chunk boundary; with strictly increasing z, z_index should already align when new chunk begins
+            start_z = (z_index // zc) * zc
+            self._ensure_active_buffer(level, start_z)
+
+        offset = z_index - self.buf_start[level]
+        self.buffers[level][offset, :, :] = plane
+        self.buf_fill[level] += 1
+
+        if self.buf_fill[level] == zc:
+            # Full chunk -> flush and reset
+            buf = self.buffers[level]
+            z0 = self.buf_start[level]
+            # hand a copy to the pool to avoid mutation races
+            self.buffers[level] = None
+            self.buf_fill[level] = 0
+            self.buf_start[level] = z0 + zc
+            self._submit_write_chunk(level, z0, buf)
+
+    def _pad_and_flush_partial_chunk(self, level: int):
+        """Pad the active buffer to full chunk size (duplicate last or zeros) and flush."""
+        zc = self.zc[level]
+        fill = self.buf_fill[level]
+        if fill == 0:
+            return
+        buf = self.buffers[level]
+        if self.flush_pad == FlushPad.DUPLICATE_LAST:
+            last = buf[fill - 1:fill, :, :]
+            repeat = np.repeat(last, zc - fill, axis=0)
+            padded = np.concatenate([buf[:fill], repeat], axis=0)
+        elif self.flush_pad == FlushPad.ZEROS:
+            pad = np.zeros((zc - fill, buf.shape[1], buf.shape[2]), dtype=np.uint16)
+            padded = np.concatenate([buf[:fill], pad], axis=0)
+        else:  # DROP
+            # simply discard and roll back z_counts to the start of the partial chunk
+            self.z_counts[level] = self.buf_start[level]
+            self.buffers[level] = None
+            self.buf_fill[level] = 0
+            return
+
+        self._submit_write_chunk(level, self.buf_start[level], padded)
+        self.buffers[level] = None
+        self.buf_fill[level] = 0
+        self.buf_start[level] += zc
+
+    def _ingest_raw(self, img0: np.ndarray):
+        with self.lock:
+            # Level 0: write into active chunk
+            z0 = self._reserve_z(0)
+            self._append_to_active_buffer(0, z0, img0)
+
+            # Build and cascade upper levels (true 3D, factor 2^L)
+            if self.levels > 1:
+                self._emit_next(level=1, candidate_xy=ds2_mean_uint16(img0))
+
+
+
+    def _emit_next(self, level: int, candidate_xy: np.ndarray):
+        if level >= self.levels:
+            return
+
+        if level <= self.xy_levels:
+            # XY-only stage: append every incoming slice (no Z pairing)
+            zL = self._reserve_z(level)
+            self._append_to_active_buffer(level, zL, candidate_xy)
+            # continue XY decimation upward
+            self._emit_next(level + 1, ds2_mean_uint16(candidate_xy))
+            return
+
+        # 3D stage: pair consecutive planes along Z
+        if not hasattr(self, "_pair_buf"):
+            self._pair_buf = [None] * self.levels
+
+        buf = self._pair_buf[level]
+        if buf is None:
+            self._pair_buf[level] = candidate_xy
+            return
+
+        out_3d = dsZ2_mean_uint16(buf, candidate_xy)
+        self._pair_buf[level] = None
+
+        zL = self._reserve_z(level)
+        self._append_to_active_buffer(level, zL, out_3d)
+
+        # propagate upward with further XY decimation
+        self._emit_next(level + 1, ds2_mean_uint16(out_3d))
+
+
+# ---------- Multiprocessing writer worker ----------
+def omezarr_writer_worker(
+    shm_name: str,
+    frame_shape: tuple[int, int],
+    ring_size: int,
+    writer_kwargs: dict,
+    work_q: mp.Queue,
+    free_q: mp.Queue,
+):
+    """
+    Child process:
+    - Attaches to shared memory
+    - Creates Live3DPyramidWriter
+    - Loops reading slot indices from work_q
+    - For each slot, takes the frame from shared memory and pushes it
+    - Returns slot to free_q when done
+    """
+
+    import numpy as np
+
+    # Attach to shared memory
+    shm = shared_memory.SharedMemory(name=shm_name)
+    Y, X = frame_shape
+    ring = np.ndarray((ring_size, Y, X), dtype=np.uint16, buffer=shm.buf)
+
+    writer = Live3DPyramidWriter(**writer_kwargs)
+
+    try:
+        while True:
+            slot = work_q.get()
+            if slot is None:
+                break
+
+            frame = ring[slot]          # view into shared memory
+            writer.push_slice(frame)
+
+            # Slot now reusable
+            free_q.put(slot)
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Error closing Live3DPyramidWriter in worker")
+        shm.close()
+
+
