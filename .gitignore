@@ -9,6 +9,8 @@ __pycache__/
 # Project specific
 */settings.ini
 */groups.ini
+tests/data/*
+!tests/data/.gitkeep
 
 # Distribution / packaging
 .Python
