@@ -14,7 +14,7 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 
 # Local imports
-from helpers import *
+from .helpers import *
 
 VERBOSE = True
 STORE_PATH = "volume.ome.zarr"
@@ -289,7 +289,8 @@ class Live3DPyramidWriter:
                  async_close: bool = True,
                  shard_shape: Tuple[int, int, int] | None = None,
                  translation: Tuple[int,int,int] = (0,0,0),
-                 ome_version: str = "0.5"):
+                 ome_version: str = "0.5",
+                 write_level0: bool = True):
 
         self.spec = spec
         self.chunk_scheme = chunk_scheme
@@ -298,6 +299,7 @@ class Live3DPyramidWriter:
         self.max_workers = max_workers or min(8, os.cpu_count() or 4)
         self.async_close = async_close
         self.finalize_future = None
+        self.write_level0 = write_level0
 
         self.root, self.arrs = init_ome_zarr(
             spec, path,
@@ -323,6 +325,10 @@ class Live3DPyramidWriter:
             zc, yc, xc = self.chunk_scheme.chunks_for_level(l, (z_l, y_l, x_l))
             self.zc.append(zc)
             self.yx_shapes.append((y_l, x_l))
+
+        # Preserve existing level 0 when multiscales-only mode is requested
+        if not self.write_level0 and self.arrs:
+            self.z_counts[0] = self.arrs[0].shape[0]
 
         # Concurrency primitives
         self.q = queue.Queue(maxsize=ingest_queue_size)
@@ -360,8 +366,8 @@ class Live3DPyramidWriter:
         print("Live3DPyramidWriter: finalized.")
 
     def close_sync(self):
-        self.stop.set()
         self.q.put(None)
+        self.stop.set()
         self.worker.join()
 
         with self.lock:
@@ -376,6 +382,8 @@ class Live3DPyramidWriter:
         self.pool.shutdown(wait=True)
 
         for l, a in enumerate(self.arrs):
+            if l == 0 and not self.write_level0:
+                continue
             a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
 
     # inside class Live3DPyramidWriter
@@ -392,8 +400,8 @@ class Live3DPyramidWriter:
         return self.finalize_future
 
     def _finalize(self):
-        self.stop.set()
         self.q.put(None)
+        self.stop.set()
         self.worker.join()
 
         with self.lock:
@@ -407,6 +415,8 @@ class Live3DPyramidWriter:
         self.pool.shutdown(wait=True)
 
         for l, a in enumerate(self.arrs):
+            if l == 0 and not self.write_level0:
+                continue
             a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
 
         # optional: mark completion for external watchers
@@ -446,7 +456,7 @@ class Live3DPyramidWriter:
     def _consume(self):
         while True:
             item = self.q.get()
-            if item is None or self.stop.is_set():
+            if item is None:
                 break
             self._ingest_raw(item)
 
@@ -503,6 +513,8 @@ class Live3DPyramidWriter:
 
     def _pad_and_flush_partial_chunk(self, level: int):
         """Pad the active buffer to full chunk size (duplicate last or zeros) and flush."""
+        if level == 0 and not self.write_level0:
+            return
         zc = self.zc[level]
         fill = self.buf_fill[level]
         if fill == 0:
@@ -529,9 +541,10 @@ class Live3DPyramidWriter:
 
     def _ingest_raw(self, img0: np.ndarray):
         with self.lock:
-            # Level 0: write into active chunk
-            z0 = self._reserve_z(0)
-            self._append_to_active_buffer(0, z0, img0)
+            # Level 0: optionally write into active chunk
+            if self.write_level0:
+                z0 = self._reserve_z(0)
+                self._append_to_active_buffer(0, z0, img0)
 
             # Build and cascade upper levels (true 3D, factor 2^L)
             if self.levels > 1:

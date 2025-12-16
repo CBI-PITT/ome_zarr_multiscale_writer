@@ -6,10 +6,39 @@ import numpy as np
 
 from zarr.codecs import BloscCodec, BloscShuffle, ShardingCodec
 
-from helpers import plan_levels, compute_xy_only_levels
-from zarr_tools import ChunkScheme, FlushPad, PyramidSpec, Live3DPyramidWriter
+from .helpers import plan_levels, compute_xy_only_levels
+from .zarr_tools import ChunkScheme, FlushPad, PyramidSpec, Live3DPyramidWriter
 
 # app = typer.Typer()
+
+# ---------- Metadata helpers ----------
+def _extract_multiscales_metadata(group):
+    """Return the first multiscales entry (OME-Zarr 0.4 or 0.5) if present."""
+    ome = group.attrs.get("ome")
+    if isinstance(ome, dict):
+        multiscales = ome.get("multiscales")
+        if isinstance(multiscales, (list, tuple)) and multiscales:
+            return multiscales[0]
+    multiscales = group.attrs.get("multiscales")
+    if isinstance(multiscales, (list, tuple)) and multiscales:
+        return multiscales[0]
+    return None
+
+def _infer_voxel_size(group, default=None):
+    """Try to infer voxel size from metadata; fall back to provided default."""
+    ms = _extract_multiscales_metadata(group)
+    if not ms:
+        return default or VOXEL_SIZE
+    datasets = ms.get("datasets", [])
+    if not datasets:
+        return default or VOXEL_SIZE
+    transforms = datasets[0].get("coordinateTransformations", [])
+    for t in transforms:
+        if t.get("type") == "scale":
+            scale = t.get("scale")
+            if scale and len(scale) >= 3:
+                return tuple(scale[:3])
+    return default or VOXEL_SIZE
 
 # A function to simplify writing a numpy array to an OME-Zarr multiscale pyramid.
 MAX_WORKERS = min(8, os.cpu_count() or 4)
@@ -43,7 +72,8 @@ def write_ome_zarr_multiscale(
         ome_version: str = OME_VERSION,
         max_workers: int=MAX_WORKERS,
         async_close: bool = ASYNC_CLOSE,
-        flush_pad: FlushPad = FlushPad.DUPLICATE_LAST
+        flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
+        write_level0: bool = True
         ):
 
     """Write a numpy array to an OME-Zarr multiscale pyramid."""
@@ -84,6 +114,7 @@ def write_ome_zarr_multiscale(
         ome_version=ome_version,
         ingest_queue_size=ingest_queue_size,
         max_inflight_chunks=max_inflight_chunks,
+        write_level0=write_level0,
     ) as omezarr_writer:
 
         for idx, zplane in enumerate(data):
@@ -93,8 +124,8 @@ def write_ome_zarr_multiscale(
 
 def generate_multiscales_from_omezarr(
         source_path: Path | str,
-        target_path: Path | str,
-        voxel_size: Tuple[int, int, int]=VOXEL_SIZE,
+        target_path: Path | str | None = None,
+        voxel_size: Tuple[int, int, int] | None = None,
         start_chunks: Tuple[int, int, int]=START_CHUNKS,
         end_chunks: Tuple[int, int, int]=END_CHUNKS,
         compressor: str=COMPRESSOR,
@@ -106,18 +137,40 @@ def generate_multiscales_from_omezarr(
         ome_version: str = OME_VERSION,
         max_workers: int=MAX_WORKERS,
         async_close: bool = ASYNC_CLOSE,
-        flush_pad: FlushPad = FlushPad.DUPLICATE_LAST
+        flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
+        force: bool = False
         ):
-    """Generate multiscale pyramid from existing OME-Zarr dataset."""
+    """Generate multiscale pyramid from existing OME-Zarr dataset.
+
+    When the source already contains multiple levels and target_path is the same as the source,
+    generation is skipped unless force=True. If target_path is None, multiscales are written back
+    into the source store.
+    """
     import zarr
 
+    target_path = target_path or source_path
     source_group = zarr.open(source_path, mode='r')
+    level_keys = [k for k in source_group.array_keys() if str(k).isdigit()]
+    has_level_zero = "0" in level_keys
+    has_multiscales = len(level_keys) > 1
+
+    if not has_level_zero:
+        raise ValueError(f"No level 0 array found in {source_path}")
+
+    if has_multiscales and target_path == source_path and not force:
+        print(f"Multiscales already present at {source_path}; skipping generation.")
+        return target_path
+
     full_res_array = source_group['0']
+    inferred_voxel_size = voxel_size or _infer_voxel_size(source_group)
+    ms_meta = _extract_multiscales_metadata(source_group) or {}
+    ome_version = ms_meta.get("version", ome_version)
+    write_level0 = not (target_path == source_path and has_level_zero)
 
     write_ome_zarr_multiscale(
         data=full_res_array,
         path=target_path,
-        voxel_size=voxel_size,
+        voxel_size=inferred_voxel_size,
         generate_multiscales=True,
         start_chunks=start_chunks,
         end_chunks=end_chunks,
@@ -130,8 +183,10 @@ def generate_multiscales_from_omezarr(
         ome_version=ome_version,
         max_workers=max_workers,
         async_close=async_close,
-        flush_pad=flush_pad
-    ))
+        flush_pad=flush_pad,
+        write_level0=write_level0,
+    )
+    return target_path
 
 
 if __name__ == '__main__':
