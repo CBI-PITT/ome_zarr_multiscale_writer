@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 import typer
 
-from .write import (
+from write import (
     ASYNC_CLOSE,
     COMPRESSOR,
     COMPRESSION_LEVEL,
@@ -18,11 +18,12 @@ from .write import (
     TRANSLATION,
     generate_multiscales_from_omezarr,
 )
-from .zarr_tools import FlushPad
+from zarr_tools import FlushPad
 
 app = typer.Typer(
     add_completion=False,
     help="Build OME-Zarr multiscale pyramids from existing level 0 data.",
+    no_args_is_help=True,
 )
 
 
@@ -69,7 +70,7 @@ def generate(
         metavar="Z Y X",
         help="Optional shard shape for Zarr v3 stores (z y x).",
     ),
-    translation: Tuple[int, int, int] = typer.Option(
+    translation: Tuple[float, float, float] = typer.Option(
         TRANSLATION,
         "--translation",
         metavar="Z Y X",

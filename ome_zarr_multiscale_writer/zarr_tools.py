@@ -14,7 +14,7 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 
 # Local imports
-from .helpers import *
+from helpers import *
 
 VERBOSE = True
 STORE_PATH = "volume.ome.zarr"

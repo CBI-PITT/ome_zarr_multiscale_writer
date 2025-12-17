@@ -15,7 +15,7 @@ from ome_zarr_multiscale_writer.write import write_ome_zarr_multiscale
 
 def test_cli_generates_multiscales(tmp_path: Path):
     store_path = tmp_path / "cli_store.ome.zarr"
-    data = np.arange(64 * 64 * 64, dtype=np.uint16).reshape((64, 64, 64))
+    data = np.arange(512 * 512 * 512, dtype=np.uint16).reshape((512, 512, 512))
 
     write_ome_zarr_multiscale(
         data,
@@ -23,7 +23,13 @@ def test_cli_generates_multiscales(tmp_path: Path):
         generate_multiscales=False,
         async_close=False,
         voxel_size=(2.0, 0.5, 0.5),
+        start_chunks=(256, 256, 256),
+        end_chunks=(64, 64, 64),
     )
+
+    group = zarr.open(store_path, mode="r")
+    assert sorted(group.array_keys()) == ["0"]
+    original_plane0 = np.array(group["0"][0])
 
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
@@ -50,7 +56,15 @@ def test_cli_generates_multiscales(tmp_path: Path):
     assert result.returncode == 0, result.stderr or result.stdout
 
     store = zarr.open(store_path, mode="r")
-    assert sorted(store.array_keys()) == ["0", "1", "2"]
-    assert store["0"].shape == (64, 64, 64)
-    assert store["1"].shape == (64, 32, 32)
-    assert store["2"].shape == (32, 16, 16)
+    assert sorted(group.array_keys()) == ["0", "1", "2", "3"]
+    assert group["0"].shape == (512, 512, 512)
+    assert group["1"].shape == (512, 256, 256)  # 2x downsampled
+    assert group["2"].shape == (512, 128, 128)  # 4x downsampled
+    assert group["3"].shape == (256, 64, 64)  # 8x downsampled
+
+    # Level 0 data should remain intact when generating additional scales
+    np.testing.assert_array_equal(group["0"][0], original_plane0)
+
+    # Multiscales metadata should now describe two datasets
+    ms = group.attrs.get("multiscales") or group.attrs.get("ome", {}).get("multiscales")
+    assert ms and len(ms[0]["datasets"]) == 4

@@ -6,10 +6,12 @@ import numpy as np
 
 from zarr.codecs import BloscCodec, BloscShuffle, ShardingCodec
 
-from .helpers import plan_levels, compute_xy_only_levels
-from .zarr_tools import ChunkScheme, FlushPad, PyramidSpec, Live3DPyramidWriter
+from helpers import plan_levels, compute_xy_only_levels
+from zarr_tools import ChunkScheme, FlushPad, PyramidSpec, Live3DPyramidWriter
 
 # app = typer.Typer()
+
+VERBOSE = False
 
 # ---------- Metadata helpers ----------
 def _extract_multiscales_metadata(group):
@@ -118,14 +120,14 @@ def write_ome_zarr_multiscale(
     ) as omezarr_writer:
 
         for idx, zplane in enumerate(data):
-            print(f'Pushing slice {idx+1}/{data.shape[0]}')
+            if VERBOSE: print(f'Pushing slice {idx+1}/{data.shape[0]}')
             omezarr_writer.push_slice(zplane)
 
 
 def generate_multiscales_from_omezarr(
         source_path: Path | str,
         target_path: Path | str | None = None,
-        voxel_size: Tuple[int, int, int] | None = None,
+        voxel_size: Tuple[float, float, float] | None = None,
         start_chunks: Tuple[int, int, int]=START_CHUNKS,
         end_chunks: Tuple[int, int, int]=END_CHUNKS,
         compressor: str=COMPRESSOR,
@@ -133,7 +135,7 @@ def generate_multiscales_from_omezarr(
         ingest_queue_size: int = INGEST_QUEUE_SIZE,
         max_inflight_chunks: int | None = MAX_INFLIGHT_CHUNKS,
         shard_shape: Tuple[int, int, int] | None = None,
-        translation: Tuple[int,int,int] = TRANSLATION,
+        translation: Tuple[float,float,float] = TRANSLATION,
         ome_version: str = OME_VERSION,
         max_workers: int=MAX_WORKERS,
         async_close: bool = ASYNC_CLOSE,
@@ -222,7 +224,7 @@ if __name__ == '__main__':
     write_ome_zarr_multiscale(
         data,
         path=output,
-        voxel_size=(2, 0.5, 0.5),
+        voxel_size=(2.0, 0.5, 0.5),
         generate_multiscales=True,
         start_chunks=(32, 256, 256),
         end_chunks=(256, 256, 256),
