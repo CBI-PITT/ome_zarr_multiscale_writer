@@ -37,6 +37,7 @@ def _run_generate_and_validate(store_path: Path):
         voxel_size=(2.0, 0.5, 0.5),
         start_chunks=(256, 256, 256),
         end_chunks=(64, 64, 64),
+        ome_version="0.4",
     )
 
 
@@ -62,3 +63,90 @@ def test_open_zarr():
         assert z_slice.shape == (512, 512)
         z_slice_count += 1
     assert z_slice_count == 512
+
+    # Test dynamic resolution level switching
+    multiscale_array.resolution_level = 1
+    assert multiscale_array.shape == (512, 256, 256)
+    assert multiscale_array.dtype == np.uint16
+    assert multiscale_array.ndim == 3
+    assert multiscale_array.size == 512 * 256 * 256
+
+    # Test iteration at level 1
+    z_slice_count = 0
+    for z_slice in multiscale_array:
+        assert z_slice.shape == (256, 256)
+        z_slice_count += 1
+    assert z_slice_count == 512
+
+    # Test slicing at level 1
+    slice_data = multiscale_array[0:5, 0:5, 0:5]
+    assert slice_data.shape == (5, 5, 5)
+
+    # Switch to level 2
+    multiscale_array.resolution_level = 2
+    assert multiscale_array.shape == (512, 128, 128)
+
+    # Test iteration at level 2
+    z_slice_count = 0
+    for z_slice in multiscale_array:
+        assert z_slice.shape == (128, 128)
+        z_slice_count += 1
+    assert z_slice_count == 512
+
+    # Test chunking properties at level 0
+    multiscale_array.resolution_level = 0
+    assert multiscale_array.chunks == (256, 256, 256)
+    assert multiscale_array.compressor is not None
+    assert multiscale_array.nchunks > 0
+
+    # Test chunking properties at level 1
+    multiscale_array.resolution_level = 1
+    assert multiscale_array.chunks == (128, 128, 128)
+    assert multiscale_array.nchunks > 0
+
+    # Test chunking properties at level 2
+    multiscale_array.resolution_level = 2
+    assert multiscale_array.chunks == (64, 64, 64)
+    assert multiscale_array.nchunks > 0
+
+
+def test_open_zarr_ome05():
+    # Test with OME-Zarr 0.5 (Zarr v3)
+    store_path = _prepare_store(TEST_DATA_DIR, "reader05.ome.zarr")
+    data = np.arange(512 * 512 * 512, dtype=np.uint16).reshape((512, 512, 512))
+
+    write_ome_zarr_multiscale(
+        data,
+        path=store_path,
+        generate_multiscales=True,
+        async_close=False,  # keep test deterministic
+        voxel_size=(2.0, 0.5, 0.5),
+        start_chunks=(128, 128, 128),
+        end_chunks=(64, 64, 64),
+        shard_shape=(512, 512, 512),  # Full array sharding keeps chunks unchanged
+        ome_version="0.5",
+    )
+
+    multiscale_array = OmeZarrArray(str(store_path))
+    assert multiscale_array.resolution_level == 0
+    assert multiscale_array.shape == (512, 512, 512)
+    assert multiscale_array.dtype == np.uint16
+    assert multiscale_array.ndim == 3
+    assert multiscale_array.size == 512 * 512 * 512
+
+    # Test chunking properties at level 0
+    assert multiscale_array.chunks == (128, 128, 128)
+    assert multiscale_array.compressor is not None
+    assert multiscale_array.nchunks > 0
+
+    # Test iteration over z-slices
+    z_slice_count = 0
+    for z_slice in multiscale_array:
+        assert z_slice.shape == (512, 512)
+        z_slice_count += 1
+    assert z_slice_count == 512
+
+    # Test resolution level switching
+    multiscale_array.resolution_level = 1
+    assert multiscale_array.shape == (512, 256, 256)
+    assert multiscale_array.chunks == (64, 64, 64)
