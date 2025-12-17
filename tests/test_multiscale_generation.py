@@ -27,7 +27,7 @@ def _prepare_store(base: Path, name: str = "sample.ome.zarr") -> Path:
 
 def test_generate_multiscales_from_level0_only():
     # Create a small level-0-only dataset inside a repo-local, ignored folder
-    store_path = _prepare_store(TEST_DATA_DIR)
+    store_path = _prepare_store(TEST_DATA_DIR, "direct_sample.ome.zarr")
     _run_generate_and_validate(store_path)
 
 
@@ -62,7 +62,7 @@ def _run_generate_and_validate(store_path: Path):
     assert group["0"].shape == (512, 512, 512)
     assert group["1"].shape == (512, 256, 256)  # 2x downsampled
     assert group["2"].shape == (512, 128, 128)  # 4x downsampled
-    assert group["3"].shape == (256, 64, 64)    # 8x downsampled
+    assert group["3"].shape == (256, 64, 64)  # 8x downsampled
 
     # Level 0 data should remain intact when generating additional scales
     np.testing.assert_array_equal(group["0"][0], original_plane0)
@@ -75,7 +75,7 @@ def _run_generate_and_validate(store_path: Path):
 def main(base_path: Path | str = TEST_DATA_DIR):
     """Manual test harness: write level-0-only data to the given path and generate multiscales."""
 
-    store_path = _prepare_store(Path(base_path))
+    store_path = _prepare_store(Path(base_path), "direct_sample.ome.zarr")
     _run_generate_and_validate(store_path)
 
 

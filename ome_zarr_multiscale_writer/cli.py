@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 import typer
 
-from write import (
+from .write import (
     ASYNC_CLOSE,
     COMPRESSOR,
     COMPRESSION_LEVEL,
@@ -18,13 +18,18 @@ from write import (
     TRANSLATION,
     generate_multiscales_from_omezarr,
 )
-from zarr_tools import FlushPad
+from .zarr_tools import FlushPad
 
 app = typer.Typer(
     add_completion=False,
     help="Build OME-Zarr multiscale pyramids from existing level 0 data.",
     no_args_is_help=True,
 )
+
+
+@app.callback(invoke_without_command=False)
+def _cli() -> None:
+    """CLI entrypoint; delegates to subcommands such as `generate`."""
 
 
 @app.command("generate")
