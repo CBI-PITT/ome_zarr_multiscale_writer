@@ -52,7 +52,7 @@ END_CHUNKS = (256, 256, 256)    # default ending chunk shape (z,y,x)
 VOXEL_SIZE = (1,1,1)  # default voxel size (z,y,x) in microns
 GENERATE_MULTISCALES = True  # whether to generate multiscale pyramid
 
-TRANSLATION = (0,0,0)  # default translation
+TRANSLATION = (0.0,0.0,0.0)  # default translation
 INGEST_QUEUE_SIZE = 8
 MAX_INFLIGHT_CHUNKS = MAX_WORKERS // 2 if MAX_WORKERS >=2 else 1
 
@@ -61,7 +61,7 @@ ASYNC_CLOSE = False
 def write_ome_zarr_multiscale(
         data: np.ndarray,
         path: Path | str,
-        voxel_size: Tuple[int, int, int]=VOXEL_SIZE,
+        voxel_size: Tuple[float, float, float]=VOXEL_SIZE,
         generate_multiscales: bool=GENERATE_MULTISCALES,
         start_chunks: Tuple[int, int, int]=START_CHUNKS,
         end_chunks: Tuple[int, int, int]=END_CHUNKS,
@@ -70,7 +70,7 @@ def write_ome_zarr_multiscale(
         ingest_queue_size: int = INGEST_QUEUE_SIZE,
         max_inflight_chunks: int | None = MAX_INFLIGHT_CHUNKS,
         shard_shape: Tuple[int, int, int] | None = None,
-        translation: Tuple[int,int,int] = TRANSLATION,
+        translation: Tuple[float,float,float] = TRANSLATION,
         ome_version: str = OME_VERSION,
         max_workers: int=MAX_WORKERS,
         async_close: bool = ASYNC_CLOSE,
