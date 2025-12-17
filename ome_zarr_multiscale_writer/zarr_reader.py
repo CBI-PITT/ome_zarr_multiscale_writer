@@ -29,6 +29,14 @@ class OmeZarrArray:
             raise ValueError("Invalid multiscales: missing datasets")
         self._resolution_level: int = 0
 
+    def _get_dataset(self):
+        """Get the current resolution level's dataset."""
+        return self.store[self._get_dataset_path()]
+
+    def _get_dataset_path(self) -> str:
+        """Get the current resolution level's dataset path."""
+        return self._scale_datasets[self.resolution_level]["path"]
+
     @property
     def resolution_level(self) -> int:
         return self._resolution_level
@@ -39,39 +47,29 @@ class OmeZarrArray:
             raise ValueError(f"Level must be 0-{len(self._scale_datasets) - 1}")
         self._resolution_level = level
 
-    def __array__(self, dtype: Any = None) -> np.ndarray:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return np.array(self.store[dataset_path], dtype=dtype)
-
     @property
     def shape(self) -> tuple:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path].shape
+        return self._get_dataset().shape
 
     @property
     def dtype(self) -> np.dtype:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path].dtype
+        return self._get_dataset().dtype
 
     @property
     def ndim(self) -> int:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path].ndim
+        return self._get_dataset().ndim
 
     @property
     def size(self) -> int:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path].size
+        return self._get_dataset().size
 
     @property
     def chunks(self) -> tuple:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path].chunks
+        return self._get_dataset().chunks
 
     @property
     def compressor(self) -> object:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        dataset = self.store[dataset_path]
+        dataset = self._get_dataset()
         # Handle Zarr v2 vs v3 compressor access
         if hasattr(dataset, "metadata") and dataset.metadata.zarr_format == 2:
             return dataset.compressor
@@ -81,20 +79,16 @@ class OmeZarrArray:
 
     @property
     def nchunks(self) -> int:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path].nchunks_initialized
+        return self._get_dataset().nchunks_initialized
 
     @property
     def cdata_shape(self) -> tuple:
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path].cdata_shape
+        return self._get_dataset().cdata_shape
 
     def __getitem__(self, key):
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        return self.store[dataset_path][key]
+        return self._get_dataset()[key]
 
     def __iter__(self):
-        dataset_path = self._scale_datasets[self.resolution_level]["path"]
-        dataset = self.store[dataset_path]
+        dataset = self._get_dataset()
         for i in range(dataset.shape[0]):
             yield dataset[i]
