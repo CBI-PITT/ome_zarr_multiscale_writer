@@ -48,6 +48,7 @@ def test_open_zarr():
 
     multiscale_array = OmeZarrArray(str(store_path))
     print(multiscale_array)
+    assert multiscale_array.ResolutionLevels == 4  # 0.4 test creates 4 levels
     assert multiscale_array.resolution_level == 0
     assert multiscale_array.shape == (512, 512, 512)
     assert multiscale_array.dtype == np.uint16
@@ -128,6 +129,7 @@ def test_open_zarr_ome05():
     )
 
     multiscale_array = OmeZarrArray(str(store_path))
+    assert multiscale_array.ResolutionLevels == 4  # 0.4 test creates 4 levels
     assert multiscale_array.resolution_level == 0
     assert multiscale_array.shape == (512, 512, 512)
     assert multiscale_array.dtype == np.uint16

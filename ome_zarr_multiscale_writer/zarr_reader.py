@@ -38,13 +38,18 @@ class OmeZarrArray:
         return self._scale_datasets[self.resolution_level]["path"]
 
     @property
+    def ResolutionLevels(self) -> int:
+        """Total number of available resolution levels."""
+        return len(self._scale_datasets)
+
+    @property
     def resolution_level(self) -> int:
         return self._resolution_level
 
     @resolution_level.setter
     def resolution_level(self, level: int) -> None:
-        if level < 0 or level >= len(self._scale_datasets):
-            raise ValueError(f"Level must be 0-{len(self._scale_datasets) - 1}")
+        if level < 0 or level >= self.ResolutionLevels:
+            raise ValueError(f"Level must be 0-{self.ResolutionLevels - 1}")
         self._resolution_level = level
 
     @property
