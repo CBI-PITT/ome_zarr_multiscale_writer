@@ -506,3 +506,20 @@ def test_timepoint_lock_with_resolution_levels():
 
     finally:
         OmeZarrArray._get_dataset = original_get_dataset
+
+if __name__ == "__main__":
+    # Example usage
+    ome_zarr_path = r"Z:\Acquire\MesoSPIM\alan-test\spinal cord 16x\spinal_cord_16x_Mag16x_Ch561_montage.ome.zarr"  # Replace with your OME-Zarr path
+    ome_array = OmeZarrArray(ome_zarr_path)
+
+    print(f"Total resolution levels: {ome_array.ResolutionLevels}")
+    for level in range(ome_array.ResolutionLevels):
+        ome_array.resolution_level = level
+        print(f"Level {level} shape: {ome_array.shape}, dtype: {ome_array.dtype}")
+
+    # Example of setting timepoint lock if time axis exists
+    try:
+        ome_array.timepoint_lock = 0  # Lock to timepoint 0
+        print(f"Shape with timepoint lock: {ome_array.shape}")
+    except ValueError as e:
+        print(e)
