@@ -5,6 +5,8 @@ from zarr import Array
 from ome_zarr_models import open_ome_zarr
 from ome_zarr_models.v05.image import Image as ImageV05
 from ome_zarr_models.v04.image import Image as ImageV04
+from pathlib import Path
+from .zarr_tools import Live3DPyramidWriter, PyramidSpec, ChunkScheme, FlushPad
 
 
 class OmeZarrArray:
@@ -284,6 +286,193 @@ class OmeZarrArray:
     def validation_error(self) -> Optional[str]:
         """Convenience property to get validation error message for current array."""
         return self.validate_ome_zarr_path(self.store_path, detailed_errors=True)[1]
+
+    def create_multiscales(
+        self,
+        target_path: Optional[Union[str, Path]] = None,
+        voxel_size: Optional[Tuple[float, float, float]] = None,
+        levels: int = 4,
+        start_chunks: Tuple[int, int, int] = (32, 512, 512),
+        end_chunks: Tuple[int, int, int] = (256, 256, 256),
+        compressor: str = "zstd",
+        compression_level: int = 5,
+        flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
+        force: bool = False,
+        **kwargs,
+    ) -> str:
+        """
+        Create or recreate multiscales from the full resolution data in this OmeZarrArray.
+
+        Uses Live3DPyramidWriter to generate a proper multiscale pyramid from the
+        highest resolution data (level 0) in the current array.
+
+        Args:
+            target_path: Optional destination path for the new multiscales.
+                        If None, recreates multiscales in the current store.
+            voxel_size: Physical voxel size (z, y, x). If None, attempts to infer from metadata.
+            levels: Number of pyramid levels to generate.
+            start_chunks: Chunk shape for level 0 (z, y, x).
+            end_chunks: Target chunk shape for coarsest level (z, y, x).
+            compressor: Compressor name (e.g., 'zstd', 'lz4').
+            compression_level: Compression level for the compressor.
+            flush_pad: How to handle partially filled chunks.
+            force: If True, recreates multiscales even if they already exist.
+            **kwargs: Additional arguments passed to Live3DPyramidWriter.
+
+        Returns:
+            Path to the store containing the created multiscales.
+
+        Raises:
+            ValueError: If the array doesn't contain level 0 data or other validation errors.
+        """
+        # Ensure we're working with level 0 (full resolution)
+        original_level = self.resolution_level
+        self.resolution_level = 0
+
+        try:
+            # Get the full resolution data shape
+            full_res_shape = self.shape
+
+            # Determine if this is 5D data (t, c, z, y, x) or 3D (z, y, x)
+            if len(full_res_shape) == 5:
+                t_size, c_size, z_size, y_size, x_size = full_res_shape
+            elif len(full_res_shape) == 4:
+                # Could be (t, z, y, x) or (c, z, y, x)
+                if self._has_time_axis():
+                    t_size = full_res_shape[0]
+                    c_size = 1
+                    z_size, y_size, x_size = full_res_shape[1:]
+                else:
+                    t_size = 1
+                    c_size = full_res_shape[0]
+                    z_size, y_size, x_size = full_res_shape[1:]
+            elif len(full_res_shape) == 3:
+                t_size = 1
+                c_size = 1
+                z_size, y_size, x_size = full_res_shape
+            else:
+                raise ValueError(
+                    f"Unsupported array dimensionality: {len(full_res_shape)}D"
+                )
+
+            # Create PyramidSpec
+            spec = PyramidSpec(
+                z_size_estimate=z_size,
+                y=y_size,
+                x=x_size,
+                levels=levels,
+                t_size=t_size,
+                c_size=c_size,
+            )
+
+            # Set up compressor if specified
+            if compressor == "zstd":
+                from zarr.codecs import BloscCodec, BloscShuffle
+
+                compressor_obj = BloscCodec(
+                    cname="zstd",
+                    clevel=compression_level,
+                    shuffle=BloscShuffle.bitshuffle,
+                )
+            elif compressor == "lz4":
+                from zarr.codecs import BloscCodec, BloscShuffle
+
+                compressor_obj = BloscCodec(
+                    cname="lz4",
+                    clevel=compression_level,
+                    shuffle=BloscShuffle.bitshuffle,
+                )
+            else:
+                compressor_obj = None
+
+            # Infer voxel size if not provided
+            if voxel_size is None:
+                # Try to get from metadata, otherwise use default
+                voxel_size = (1.0, 1.0, 1.0)  # Default fallback
+
+            # Determine target path
+            if target_path is None:
+                target_path = self.store_path
+
+            # Create chunk scheme
+            chunk_scheme = ChunkScheme(base=start_chunks, target=end_chunks)
+
+            # Set up Live3DPyramidWriter
+            writer = Live3DPyramidWriter(
+                spec=spec,
+                voxel_size=voxel_size,
+                path=target_path,
+                chunk_scheme=chunk_scheme,
+                compressor=compressor_obj,
+                flush_pad=flush_pad,
+                **kwargs,
+            )
+
+            # Stream the data
+            with writer:
+                if t_size == 1 and c_size == 1:
+                    # 3D case: stream z slices
+                    for z in range(z_size):
+                        slice_data = self[z]  # Get z slice as (y, x)
+                        writer.push_slice(slice_data)
+                else:
+                    # 5D case: handle time and channels
+                    for t in range(t_size):
+                        for c in range(c_size):
+                            if self._has_time_axis() and self._has_channel_axis():
+                                # Both time and channel axes
+                                for z in range(z_size):
+                                    slice_data = self[t, c, z]  # Get (y, x) slice
+                                    writer.push_slice(slice_data, t_index=t, c_index=c)
+                            elif self._has_time_axis():
+                                # Only time axis
+                                for z in range(z_size):
+                                    slice_data = self[t, z]  # Get (y, x) slice
+                                    writer.push_slice(slice_data, t_index=t)
+                            elif self._has_channel_axis():
+                                # Only channel axis
+                                for z in range(z_size):
+                                    slice_data = self[c, z]  # Get (y, x) slice
+                                    writer.push_slice(slice_data, c_index=c)
+                            else:
+                                # Fallback: treat as 3D for each t,c combination
+                                for z in range(z_size):
+                                    # Build indexing tuple dynamically
+                                    indices = []
+                                    for i, dim_size in enumerate(full_res_shape):
+                                        if i == 0:  # time dimension
+                                            indices.append(
+                                                t if t_size > 1 else slice(None)
+                                            )
+                                        elif i == 1 and c_size > 1:  # channel dimension
+                                            indices.append(c)
+                                        elif (
+                                            i == len(full_res_shape) - 3
+                                        ):  # z dimension
+                                            indices.append(z)
+                                        else:
+                                            indices.append(slice(None))
+                                    slice_data = self[tuple(indices)]
+                                    # Ensure we're passing a 2D slice
+                                    if slice_data.ndim == 2:
+                                        writer.push_slice(
+                                            slice_data, t_index=t, c_index=c
+                                        )
+                                    else:
+                                        # If we got a higher-dimensional slice, take the first 2D
+                                        writer.push_slice(
+                                            slice_data.reshape(
+                                                -1, slice_data.shape[-1]
+                                            ),
+                                            t_index=t,
+                                            c_index=c,
+                                        )
+
+            return str(target_path)
+
+        finally:
+            # Restore original resolution level
+            self.resolution_level = original_level
 
     def __iter__(self):
         dataset = self._get_dataset()

@@ -43,11 +43,14 @@ class ChunkSpec:
 
 
 @dataclass
+@dataclass
 class PyramidSpec:
     z_size_estimate: int  # upper bound; we trim on close()
     y: int
     x: int
     levels: int
+    t_size: int = 1  # time dimension size (default 1 for backward compatibility)
+    c_size: int = 1  # channel dimension size (default 1 for backward compatibility)
 
 
 class FlushPad(Enum):
@@ -102,6 +105,25 @@ class ChunkScheme:
 
         # Clamp to the level's actual dimensions
         return (min(zc, z_l), min(yc, y_l), min(xc, x_l))
+
+    def chunks_for_level_5d(
+        self, level: int, tczycx_level_shape: Tuple[int, int, int, int, int]
+    ) -> Tuple[int, int, int, int, int]:
+        """
+        Generate 5D chunks (t, c, z, y, x) where t and c are always 1 for chunking.
+        The z, y, x dimensions follow the same logic as chunks_for_level().
+        """
+        t_l, c_l, z_l, y_l, x_l = tczycx_level_shape
+
+        # For 5D chunking, we always chunk t and c as 1
+        tc_chunk = 1
+        cc_chunk = 1
+
+        # Use existing logic for z, y, x dimensions
+        zycx_chunks = self.chunks_for_level(level, (z_l, y_l, x_l))
+        zc_chunk, yc_chunk, xc_chunk = zycx_chunks
+
+        return (tc_chunk, cc_chunk, zc_chunk, yc_chunk, xc_chunk)
 
 
 def _validate_divisible(
@@ -222,20 +244,34 @@ def init_ome_zarr(
     zarr_version = 2 if ome_version == "0.4" else 3
     root = zarr.open_group(path, mode="a", zarr_version=zarr_version)
     arrs = []
+
+    # Determine if we're dealing with 5D data (t,c,z,y,x) or legacy 3D (z,y,x)
+    is_5d = spec.t_size > 1 or spec.c_size > 1
+
     for l in range(spec.levels):
         zf, yf, xf = level_factors(l, xy_levels)
         z_l = ceil_div(spec.z_size_estimate, zf)
         y_l = ceil_div(spec.y, yf)
         x_l = ceil_div(spec.x, xf)
-        lvl_shape = (z_l, y_l, x_l)
 
-        chunks = chunk_scheme.chunks_for_level(l, lvl_shape)
-        # shards_l = pick_shards_for_level(shard_shape, chunks, lvl_shape)
-        shards_l = (
-            pick_shards_for_level(shard_shape, chunks, lvl_shape)
-            if zarr_version == 3
-            else None
-        )
+        if is_5d:
+            # 5D shape: (t, c, z, y, x)
+            lvl_shape = (spec.t_size, spec.c_size, z_l, y_l, x_l)
+            chunks = chunk_scheme.chunks_for_level_5d(l, lvl_shape)
+            shards_l = (
+                pick_shards_for_level(shard_shape, chunks[2:], lvl_shape[2:])
+                if zarr_version == 3
+                else None
+            )
+        else:
+            # Legacy 3D shape: (z, y, x)
+            lvl_shape = (z_l, y_l, x_l)
+            chunks = chunk_scheme.chunks_for_level(l, lvl_shape)
+            shards_l = (
+                pick_shards_for_level(shard_shape, chunks, lvl_shape)
+                if zarr_version == 3
+                else None
+            )
 
         name = f"{l}"
         if name in root:
@@ -244,8 +280,13 @@ def init_ome_zarr(
                 raise ValueError(
                     f"Existing {name}: {a.shape}/{a.dtype} != {lvl_shape}/uint16"
                 )
-            if a.shape[0] < z_l:
-                a.resize((z_l, y_l, x_l))
+            # Handle resizing for 3D vs 5D arrays
+            if is_5d:
+                if a.shape[2] < z_l:
+                    a.resize((spec.t_size, spec.c_size, z_l, y_l, x_l))
+            else:
+                if a.shape[0] < z_l:
+                    a.resize((z_l, y_l, x_l))
         elif zarr_version == 3:
             create_kwargs: Dict[str, Any] = {
                 "name": name,
@@ -259,7 +300,9 @@ def init_ome_zarr(
             if shards_l is not None:
                 # v3: inner shard (must divide chunks)
                 create_kwargs["shards"] = shards_l
-            create_kwargs["dimension_names"] = ["z", "y", "x"]
+            create_kwargs["dimension_names"] = (
+                ["t", "c", "z", "y", "x"] if is_5d else ["z", "y", "x"]
+            )
             if VERBOSE:
                 print(
                     f"[init] creating {name}: shape={lvl_shape} chunks={chunks} shards={shards_l}"
@@ -275,7 +318,8 @@ def init_ome_zarr(
 
             # optional: dimension hint for some tools
             try:
-                a.attrs["_ARRAY_DIMENSIONS"] = ["z", "y", "x"]
+                dim_names = ["t", "c", "z", "y", "x"] if is_5d else ["z", "y", "x"]
+                a.attrs["_ARRAY_DIMENSIONS"] = dim_names
             except Exception:
                 pass
 
@@ -301,22 +345,44 @@ def init_ome_zarr(
     datasets = []
     for l in range(spec.levels):
         zf, yf, xf = level_factors(l, xy_levels)
-        s = [dz * zf, dy * yf, dx * xf]
+
+        if is_5d:
+            # 5D scale factors: (t, c, z, y, x)
+            # t and c have no spatial scaling (1.0), z,y,x have spatial scaling
+            s = [1.0, 1.0, dz * zf, dy * yf, dx * xf]
+        else:
+            # Legacy 3D scale factors: (z, y, x)
+            s = [dz * zf, dy * yf, dx * xf]
+
         datasets.append(
             {
                 "path": f"{l}",
                 "coordinateTransformations": [
                     {"type": "scale", "scale": s},
-                    {"type": "translation", "translation": list(translation)},
+                    {
+                        "type": "translation",
+                        "translation": list(translation)
+                        if not is_5d
+                        else [0.0, 0.0] + list(translation),
+                    },
                 ],
             }
         )
 
-    axes = [
-        {"name": "z", "type": "space", "unit": unit},
-        {"name": "y", "type": "space", "unit": unit},
-        {"name": "x", "type": "space", "unit": unit},
-    ]
+    if is_5d:
+        axes = [
+            {"name": "t", "type": "time", "unit": "second"},
+            {"name": "c", "type": "channel"},
+            {"name": "z", "type": "space", "unit": unit},
+            {"name": "y", "type": "space", "unit": unit},
+            {"name": "x", "type": "space", "unit": unit},
+        ]
+    else:
+        axes = [
+            {"name": "z", "type": "space", "unit": unit},
+            {"name": "y", "type": "space", "unit": unit},
+            {"name": "x", "type": "space", "unit": unit},
+        ]
     if ome_version == "0.5":
         root.attrs["ome"] = {
             "version": "0.5",
@@ -375,9 +441,12 @@ class Live3DPyramidWriter:
         self.finalize_future = None
         self.write_level0 = write_level0
 
+        # Determine if we're dealing with 5D data (t,c,z,y,x) or legacy 3D (z,y,x)
+        self.is_5d = spec.t_size > 1 or spec.c_size > 1
+
         self.root, self.arrs = init_ome_zarr(
             spec,
-            path,
+            str(path),  # Convert Path to string
             chunk_scheme=chunk_scheme,
             compressor=compressor,
             voxel_size=voxel_size,
@@ -400,13 +469,26 @@ class Live3DPyramidWriter:
             z_l = ceil_div(self.spec.z_size_estimate, zf)
             y_l = ceil_div(self.spec.y, yf)
             x_l = ceil_div(self.spec.x, xf)
-            zc, yc, xc = self.chunk_scheme.chunks_for_level(l, (z_l, y_l, x_l))
+
+            if self.is_5d:
+                # 5D arrays: (t, c, z, y, x), get chunks for z,y,x
+                tc_zyx_chunks = self.chunk_scheme.chunks_for_level_5d(
+                    l, (self.spec.t_size, self.spec.c_size, z_l, y_l, x_l)
+                )
+                tc, cc, zc, yc, xc = tc_zyx_chunks
+            else:
+                # Legacy 3D arrays: (z, y, x)
+                zc, yc, xc = self.chunk_scheme.chunks_for_level(l, (z_l, y_l, x_l))
+
             self.zc.append(zc)
             self.yx_shapes.append((y_l, x_l))
 
         # Preserve existing level 0 when multiscales-only mode is requested
         if not self.write_level0 and self.arrs:
-            self.z_counts[0] = self.arrs[0].shape[0]
+            if self.is_5d:
+                self.z_counts[0] = self.arrs[0].shape[2]  # z dimension is index 2 in 5D
+            else:
+                self.z_counts[0] = self.arrs[0].shape[0]  # z dimension is index 0 in 3D
 
         # Concurrency primitives
         self.q = queue.Queue(maxsize=ingest_queue_size)
@@ -423,12 +505,64 @@ class Live3DPyramidWriter:
         self.worker.start()
 
     # ---------- Public API ----------
-    def push_slice(self, slice_u16: np.ndarray):
+    def push_slice(self, slice_u16: np.ndarray, t_index: int = 0, c_index: int = 0):
+        """
+        Push a slice to the writer. Supports multiple input formats:
+
+        Legacy 3D mode (t_size=1, c_size=1):
+        - slice_u16: 2D array with shape (y, x)
+        - t_index and c_index are ignored (defaults to 0)
+
+        5D mode (t_size>1 or c_size>1):
+        - slice_u16: 2D array with shape (y, x) for specific (t,c)
+        - OR 3D array with shape (z, y, x) for specific (t,c)
+        - t_index and c_index specify the time and channel indices
+
+        Args:
+            slice_u16: Input data (2D or 3D numpy array with dtype uint16)
+            t_index: Time index (default 0)
+            c_index: Channel index (default 0)
+        """
         assert slice_u16.dtype == np.uint16, "slice must be uint16"
-        assert slice_u16.shape == (self.spec.y, self.spec.x), (
-            f"got {slice_u16.shape}, expected {(self.spec.y, self.spec.x)}"
-        )
-        self.q.put(slice_u16, block=True)
+
+        if self.is_5d:
+            # Validate t,c indices
+            if not (0 <= t_index < self.spec.t_size):
+                raise ValueError(
+                    f"t_index {t_index} out of range [0, {self.spec.t_size})"
+                )
+            if not (0 <= c_index < self.spec.c_size):
+                raise ValueError(
+                    f"c_index {c_index} out of range [0, {self.spec.c_size})"
+                )
+
+            # Handle different input formats
+            if slice_u16.ndim == 2:
+                # Single 2D slice (y, x) - wrap with metadata for processing
+                data = (slice_u16, t_index, c_index)
+            elif slice_u16.ndim == 3:
+                # 3D data (z, y, x) - will be processed as multiple z-slices
+                if slice_u16.shape[1:] != (self.spec.y, self.spec.x):
+                    raise ValueError(
+                        f"got y,x shape {slice_u16.shape[1:]}, expected {(self.spec.y, self.spec.x)}"
+                    )
+                data = (
+                    slice_u16,
+                    t_index,
+                    c_index,
+                    True,
+                )  # True flag for 3D processing
+            else:
+                raise ValueError(f"slice_u16 must be 2D or 3D, got {slice_u16.ndim}D")
+        else:
+            # Legacy 3D mode
+            if slice_u16.shape != (self.spec.y, self.spec.x):
+                raise ValueError(
+                    f"got {slice_u16.shape}, expected {(self.spec.y, self.spec.x)}"
+                )
+            data = slice_u16
+
+        self.q.put(data, block=True)
 
     def __enter__(self):
         return self
@@ -463,7 +597,14 @@ class Live3DPyramidWriter:
         for l, a in enumerate(self.arrs):
             if l == 0 and not self.write_level0:
                 continue
-            a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
+            if self.is_5d:
+                # 5D arrays: (t, c, z, y, x) -> resize z dimension
+                a.resize(
+                    (a.shape[0], a.shape[1], self.z_counts[l], a.shape[3], a.shape[4])
+                )
+            else:
+                # 3D arrays: (z, y, x) -> traditional resize
+                a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
 
     # inside class Live3DPyramidWriter
 
@@ -496,7 +637,14 @@ class Live3DPyramidWriter:
         for l, a in enumerate(self.arrs):
             if l == 0 and not self.write_level0:
                 continue
-            a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
+            if self.is_5d:
+                # 5D arrays: (t, c, z, y, x) -> resize z dimension
+                a.resize(
+                    (a.shape[0], a.shape[1], self.z_counts[l], a.shape[3], a.shape[4])
+                )
+            else:
+                # 3D arrays: (z, y, x) -> traditional resize
+                a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
 
         # optional: mark completion for external watchers
         try:
@@ -547,42 +695,97 @@ class Live3DPyramidWriter:
         self.z_counts[level] += 1
         return z
 
-    def _submit_write_chunk(self, level: int, z0: int, buf3d: np.ndarray):
-        # acquire *before* grabbing the lock (it’s called from inside-lock code now)
+    def _submit_write_chunk(
+        self, level: int, z0: int, buf3d: np.ndarray, t_index: int = 0, c_index: int = 0
+    ):
+        # acquire *before* grabbing the lock (it's called from inside-lock code now)
 
         if (
             self.max_inflight_chunks == 1 and self.max_inflight_chunks == 1
         ):  # Helps with single threaded debugging
-            self.arrs[level][z0 : z0 + buf3d.shape[0], :, :] = buf3d
+            if buf3d.ndim == 5:  # 5D data
+                self.arrs[level][t_index, c_index, z0 : z0 + buf3d.shape[2], :, :] = (
+                    buf3d[0, 0, :, :, :]
+                )
+            else:  # 3D data
+                self.arrs[level][z0 : z0 + buf3d.shape[0], :, :] = buf3d
         else:
             self._inflight_sem.acquire()
-            fut = self.pool.submit(self._write_chunk_slice, self.arrs[level], z0, buf3d)
+            fut = self.pool.submit(
+                self._write_chunk_slice,
+                self.arrs[level],
+                z0,
+                buf3d,
+                t_index,
+                c_index,
+                self.is_5d,
+            )
             # Release the slot when done (and drop ref to the future immediately)
             fut.add_done_callback(lambda _f: self._inflight_sem.release())
 
     @staticmethod
-    def _write_chunk_slice(arr, z0, buf3d):
-        arr[z0 : z0 + buf3d.shape[0], :, :] = buf3d  # contiguous, aligned write
+    def _write_chunk_slice(arr, z0, buf3d, t_index, c_index, is_5d):
+        if is_5d:
+            # 5D: (t, c, z, y, x) -> write to specific t,c slice
+            arr[t_index, c_index, z0 : z0 + buf3d.shape[2], :, :] = buf3d[0, 0, :, :, :]
+        else:
+            # 3D: (z, y, x) -> traditional write
+            arr[z0 : z0 + buf3d.shape[0], :, :] = buf3d  # contiguous, aligned write
 
-    def _ensure_active_buffer(self, level: int, start_z: int):
+    def _ensure_active_buffer(
+        self, level: int, start_z: int, t_index: int = 0, c_index: int = 0
+    ):
         """Allocate active chunk buffer for a level if absent, starting at start_z."""
         if self.buffers[level] is None:
             zc = self.zc[level]
             y_l, x_l = self.yx_shapes[level]
-            self.buffers[level] = np.empty((zc, y_l, x_l), dtype=np.uint16)
+
+            if self.is_5d:
+                # 5D buffer: (t, c, z, y, x) - but we allocate per t,c so (1, 1, z, y, x)
+                self.buffers[level] = np.empty((1, 1, zc, y_l, x_l), dtype=np.uint16)
+                # Store current t,c indices for this buffer
+                self._current_t = t_index
+                self._current_c = c_index
+            else:
+                # Legacy 3D buffer: (z, y, x)
+                self.buffers[level] = np.empty((zc, y_l, x_l), dtype=np.uint16)
+
             self.buf_fill[level] = 0
             self.buf_start[level] = start_z
 
-    def _append_to_active_buffer(self, level: int, z_index: int, plane: np.ndarray):
+    def _append_to_active_buffer(
+        self,
+        level: int,
+        z_index: int,
+        plane: np.ndarray,
+        t_index: int = 0,
+        c_index: int = 0,
+    ):
         """Append plane into the active buffer; flush when full."""
         zc = self.zc[level]
-        if self.buf_fill[level] == 0:
+
+        if self.buffers[level] is None:
             # Align start to chunk boundary; with strictly increasing z, z_index should already align when new chunk begins
             start_z = (z_index // zc) * zc
-            self._ensure_active_buffer(level, start_z)
+            self._ensure_active_buffer(level, start_z, t_index, c_index)
+
+        # Check if t or c index changed - if so, flush current buffer and start new one
+        if self.is_5d and (
+            getattr(self, "_current_t", 0) != t_index
+            or getattr(self, "_current_c", 0) != c_index
+        ):
+            if self.buf_fill[level] > 0:
+                self._pad_and_flush_partial_chunk(level)
+            start_z = (z_index // zc) * zc
+            self._ensure_active_buffer(level, start_z, t_index, c_index)
 
         offset = z_index - self.buf_start[level]
-        self.buffers[level][offset, :, :] = plane
+
+        if self.is_5d:
+            self.buffers[level][0, 0, offset, :, :] = plane
+        else:
+            self.buffers[level][offset, :, :] = plane
+
         self.buf_fill[level] += 1
 
         if self.buf_fill[level] == zc:
@@ -593,7 +796,7 @@ class Live3DPyramidWriter:
             self.buffers[level] = None
             self.buf_fill[level] = 0
             self.buf_start[level] = z0 + zc
-            self._submit_write_chunk(level, z0, buf)
+            self._submit_write_chunk(level, z0, buf, t_index, c_index)
 
     def _pad_and_flush_partial_chunk(self, level: int):
         """Pad the active buffer to full chunk size (duplicate last or zeros) and flush."""
@@ -623,46 +826,108 @@ class Live3DPyramidWriter:
         self.buf_fill[level] = 0
         self.buf_start[level] += zc
 
-    def _ingest_raw(self, img0: np.ndarray):
+    def _ingest_raw(self, data):
         with self.lock:
-            # Level 0: optionally write into active chunk
-            if self.write_level0:
-                z0 = self._reserve_z(0)
-                self._append_to_active_buffer(0, z0, img0)
+            if self.is_5d:
+                # Unpack 5D data: (slice_data, t_index, c_index, is_3d_flag)
+                if isinstance(data, tuple) and len(data) >= 3:
+                    img0, t_index, c_index = data[:3]
+                    is_3d = (
+                        len(data) == 4 and data[3]
+                    )  # fourth element indicates 3D processing
 
-            # Build and cascade upper levels (true 3D, factor 2^L)
-            if self.levels > 1:
-                self._emit_next(level=1, candidate_xy=ds2_mean_uint16(img0))
+                    if is_3d:
+                        # Process 3D data (z, y, x) slice by slice
+                        for z_idx, zplane in enumerate(img0):
+                            # Level 0: optionally write into active chunk
+                            if self.write_level0:
+                                z0 = self._reserve_z(0)
+                                self._append_to_active_buffer(
+                                    0, z0, zplane, t_index, c_index
+                                )
 
-    def _emit_next(self, level: int, candidate_xy: np.ndarray):
+                            # Build and cascade upper levels (true 3D, factor 2^L)
+                            if self.levels > 1:
+                                self._emit_next(
+                                    level=1,
+                                    candidate_xy=ds2_mean_uint16(zplane),
+                                    t_index=t_index,
+                                    c_index=c_index,
+                                )
+                    else:
+                        # Process 2D data (y, x)
+                        # Level 0: optionally write into active chunk
+                        if self.write_level0:
+                            z0 = self._reserve_z(0)
+                            self._append_to_active_buffer(0, z0, img0, t_index, c_index)
+
+                        # Build and cascade upper levels (true 3D, factor 2^L)
+                        if self.levels > 1:
+                            self._emit_next(
+                                level=1,
+                                candidate_xy=ds2_mean_uint16(img0),
+                                t_index=t_index,
+                                c_index=c_index,
+                            )
+                else:
+                    raise ValueError("Invalid 5D data format")
+            else:
+                # Legacy 3D mode: data is just the numpy array
+                img0 = data
+                # Level 0: optionally write into active chunk
+                if self.write_level0:
+                    z0 = self._reserve_z(0)
+                    self._append_to_active_buffer(0, z0, img0)
+
+                # Build and cascade upper levels (true 3D, factor 2^L)
+                if self.levels > 1:
+                    self._emit_next(level=1, candidate_xy=ds2_mean_uint16(img0))
+
+    def _emit_next(
+        self, level: int, candidate_xy: np.ndarray, t_index: int = 0, c_index: int = 0
+    ):
         if level >= self.levels:
             return
 
         if level <= self.xy_levels:
             # XY-only stage: append every incoming slice (no Z pairing)
             zL = self._reserve_z(level)
-            self._append_to_active_buffer(level, zL, candidate_xy)
+            self._append_to_active_buffer(level, zL, candidate_xy, t_index, c_index)
             # continue XY decimation upward
-            self._emit_next(level + 1, ds2_mean_uint16(candidate_xy))
+            self._emit_next(level + 1, ds2_mean_uint16(candidate_xy), t_index, c_index)
             return
 
         # 3D stage: pair consecutive planes along Z
         if not hasattr(self, "_pair_buf"):
             self._pair_buf = [None] * self.levels
 
-        buf = self._pair_buf[level]
-        if buf is None:
-            self._pair_buf[level] = candidate_xy
-            return
-
-        out_3d = dsZ2_mean_uint16(buf, candidate_xy)
-        self._pair_buf[level] = None
+        # For 5D, we need separate pair buffers for each (t,c) combination
+        if self.is_5d:
+            if not hasattr(self, "_pair_buf_5d"):
+                self._pair_buf_5d = {}  # Dict[(t,c) -> List[None|ndarray]]
+            key = (t_index, c_index)
+            if key not in self._pair_buf_5d:
+                self._pair_buf_5d[key] = [None] * self.levels
+            buf = self._pair_buf_5d[key][level]
+            if buf is None:
+                self._pair_buf_5d[key][level] = candidate_xy
+                return
+            out_3d = dsZ2_mean_uint16(buf, candidate_xy)
+            self._pair_buf_5d[key][level] = None
+        else:
+            # Legacy 3D mode
+            buf = self._pair_buf[level]
+            if buf is None:
+                self._pair_buf[level] = candidate_xy
+                return
+            out_3d = dsZ2_mean_uint16(buf, candidate_xy)
+            self._pair_buf[level] = None
 
         zL = self._reserve_z(level)
-        self._append_to_active_buffer(level, zL, out_3d)
+        self._append_to_active_buffer(level, zL, out_3d, t_index, c_index)
 
         # propagate upward with further XY decimation
-        self._emit_next(level + 1, ds2_mean_uint16(out_3d))
+        self._emit_next(level + 1, ds2_mean_uint16(out_3d), t_index, c_index)
 
 
 # ---------- Multiprocessing writer worker ----------
