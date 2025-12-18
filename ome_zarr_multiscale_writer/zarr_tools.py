@@ -6,7 +6,7 @@ import numpy as np
 import zarr
 from zarr.codecs import BloscCodec, BloscShuffle, ShardingCodec
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Union, Optional, Any, Dict, List
 from enum import Enum
 
 
@@ -26,7 +26,7 @@ VERBOSE = True
 STORE_PATH = "volume.ome.zarr"
 
 # at top-level (after imports)
-blosc_threads = max(1, os.cpu_count() // 2)
+blosc_threads = max(1, (os.cpu_count() or 1) // 2)
 try:
     import blosc2  # zarr v3 uses python-blosc2
 
@@ -143,7 +143,8 @@ def _ensure_v2_compressor(compressor):
             "bitshuffle": 2,
         }
         shuffle_int = shuffle_map.get(
-            shuffle_str, 1 if shuffle_str not in (0, 1, 2) else shuffle_str
+            str(shuffle_str),
+            1 if str(shuffle_str) not in ("0", "1", "2") else str(shuffle_str),
         )
         return BloscV2(cname=cname, clevel=clevel, shuffle=shuffle_int)
 
@@ -212,7 +213,7 @@ def init_ome_zarr(
     compressor=None,
     voxel_size=(1.0, 1.0, 1.0),
     unit="micrometer",
-    translation: Tuple[int, int, int] = (0, 0, 0),  # in units
+    translation: Tuple[float, float, float] = (0.0, 0.0, 0.0),  # in units
     xy_levels: int = 0,
     shard_shape: Tuple[int, int, int] | None = None,
     ome_version: str = "0.5",
@@ -246,19 +247,24 @@ def init_ome_zarr(
             if a.shape[0] < z_l:
                 a.resize((z_l, y_l, x_l))
         elif zarr_version == 3:
-            kwargs = dict(name=name, shape=lvl_shape, chunks=chunks, dtype="uint16")
+            create_kwargs: Dict[str, Any] = {
+                "name": name,
+                "shape": lvl_shape,
+                "chunks": chunks,
+                "dtype": "uint16",
+            }
             if compressor is not None:
                 # v3: list of codecs
-                kwargs["compressors"] = [compressor]
+                create_kwargs["compressors"] = [compressor]
             if shards_l is not None:
                 # v3: inner shard (must divide chunks)
-                kwargs["shards"] = shards_l
-            kwargs["dimension_names"] = ["z", "y", "x"]
+                create_kwargs["shards"] = shards_l
+            create_kwargs["dimension_names"] = ["z", "y", "x"]
             if VERBOSE:
                 print(
                     f"[init] creating {name}: shape={lvl_shape} chunks={chunks} shards={shards_l}"
                 )
-            a = root.create_array(**kwargs)
+            a = root.create_array(**create_kwargs)
         else:
             # Zarr v2 path
             if VERBOSE:
@@ -346,17 +352,17 @@ class Live3DPyramidWriter:
     def __init__(
         self,
         spec: PyramidSpec,
-        voxel_size=(1.0, 1.0, 1.0),
-        path=STORE_PATH,
-        max_workers=None,
+        voxel_size: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        path: Union[str, Path] = STORE_PATH,
+        max_workers: Optional[int] = None,
         chunk_scheme: ChunkScheme = ChunkScheme(),
-        compressor=None,
+        compressor: Optional[Any] = None,
         flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
         ingest_queue_size: int = 8,
-        max_inflight_chunks: int | None = None,
+        max_inflight_chunks: Optional[int] = None,
         async_close: bool = True,
-        shard_shape: Tuple[int, int, int] | None = None,
-        translation: Tuple[int, int, int] = (0, 0, 0),
+        shard_shape: Optional[Tuple[int, int, int]] = None,
+        translation: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         ome_version: str = "0.5",
         write_level0: bool = True,
     ):

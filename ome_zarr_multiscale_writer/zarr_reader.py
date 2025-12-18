@@ -1,6 +1,7 @@
 import zarr
 import numpy as np
-from typing import List, Dict, Any, cast, Union
+from typing import List, Dict, Any, cast, Union, Tuple, Any as TypingAny
+from zarr import Array
 
 
 class OmeZarrArray:
@@ -39,19 +40,18 @@ class OmeZarrArray:
             raise ValueError(
                 "Invalid multiscales format: expected list with dict as first element"
             )
-        self._axes = cast(List[Dict[str, Any]], multiscales_dict.get("axes", []))
-
-        self._scale_datasets: List[Dict[str, Any]] = cast(
-            List[Dict[str, Any]], multiscales_dict.get("datasets", [])
-        )
         if not self._scale_datasets:
             raise ValueError("Invalid multiscales: missing datasets")
         self._resolution_level: int = 0
         self._timepoint_lock: int | None = None
 
-    def _get_dataset(self):
+    def _get_dataset(self) -> Array:
         """Get the current resolution level's dataset."""
-        return self.store[self._get_dataset_path()]
+        path = self._get_dataset_path()
+        dataset = self.store[path]
+        if not isinstance(dataset, zarr.Array):
+            raise ValueError(f"Expected zarr.Array at {path}, got {type(dataset)}")
+        return dataset
 
     def _get_dataset_path(self) -> str:
         """Get the current resolution level's dataset path."""
@@ -185,7 +185,9 @@ class OmeZarrArray:
         """Check if the array has a channel axis in metadata."""
         return self._get_axis_index("channel") is not None
 
-    def __getitem__(self, key):
+    def __getitem__(
+        self, key: Union[int, slice, Tuple, np.ndarray, TypingAny]
+    ) -> Union[np.ndarray, TypingAny]:
         dataset = self._get_dataset()
         if self._timepoint_lock is not None:
             time_idx = self._get_axis_index("time")
