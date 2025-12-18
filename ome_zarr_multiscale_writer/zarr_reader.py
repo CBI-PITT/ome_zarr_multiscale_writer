@@ -411,28 +411,30 @@ class OmeZarrArray:
             # Stream the data
             with writer:
                 if t_size == 1 and c_size == 1:
-                    # 3D case: stream z slices
-                    for z in range(z_size):
-                        slice_data = self[z]  # Get z slice as (y, x)
+                    # 3D case: stream z slices using chunked generator
+                    for slice_data in self._chunked_z_slices():
                         writer.push_slice(slice_data)
                 else:
                     # 5D case: handle time and channels
                     for t in range(t_size):
                         for c in range(c_size):
                             if self._has_time_axis() and self._has_channel_axis():
-                                # Both time and channel axes
-                                for z in range(z_size):
-                                    slice_data = self[t, c, z]  # Get (y, x) slice
+                                # Both time and channel axes - use chunked generator
+                                for slice_data in self._chunked_z_slices(
+                                    t_index=t, c_index=c
+                                ):
                                     writer.push_slice(slice_data, t_index=t, c_index=c)
                             elif self._has_time_axis():
-                                # Only time axis
-                                for z in range(z_size):
-                                    slice_data = self[t, z]  # Get (y, x) slice
+                                # Only time axis - use chunked generator
+                                for slice_data in self._chunked_z_slices(
+                                    t_index=t, c_index=None
+                                ):
                                     writer.push_slice(slice_data, t_index=t)
                             elif self._has_channel_axis():
-                                # Only channel axis
-                                for z in range(z_size):
-                                    slice_data = self[c, z]  # Get (y, x) slice
+                                # Only channel axis - use chunked generator
+                                for slice_data in self._chunked_z_slices(
+                                    t_index=None, c_index=c
+                                ):
                                     writer.push_slice(slice_data, c_index=c)
                             else:
                                 # Fallback: treat as 3D for each t,c combination
@@ -493,3 +495,57 @@ class OmeZarrArray:
             # Normal iteration over first dimension
             for i in range(dataset.shape[0]):
                 yield dataset[i]
+
+    def _chunked_z_slices(
+        self, t_index: Optional[int] = None, c_index: Optional[int] = None
+    ):
+        """
+        Generator that yields z-slices one at a time while reading entire z-chunks.
+
+        This minimizes disk I/O by reading full z-chunks into memory, then
+        yielding individual z-slices from the cached chunk.
+
+        Args:
+            t_index: Fixed time index for 5D data (None for 3D or when not fixed)
+            c_index: Fixed channel index for 5D data (None for 3D or when not fixed)
+
+        Yields:
+            Individual z-slices as numpy arrays
+        """
+        dataset = self._get_dataset()
+
+        # Determine array shape and chunk structure
+        if t_index is not None and c_index is not None:
+            # 5D with both t and c fixed: array[t, c, z, y, x]
+            total_z = dataset.shape[2]  # z is third dimension
+            chunk_size = dataset.chunks[2]  # z-chunk size
+        elif t_index is not None or c_index is not None:
+            # 5D with one dimension fixed: array[dim, z, y, x]
+            total_z = dataset.shape[1]  # z is second dimension
+            chunk_size = dataset.chunks[1]  # z-chunk size
+        else:
+            # 3D case: array[z, y, x]
+            total_z = dataset.shape[0]  # z is first dimension
+            chunk_size = dataset.chunks[0]  # z-chunk size
+
+        # Process chunks one at a time
+        for chunk_start in range(0, total_z, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_z)
+
+            # Build appropriate indexing tuple for chunk read
+            if t_index is not None and c_index is not None:
+                # Read full z-chunk for fixed (t,c)
+                chunk_data = dataset[t_index, c_index, chunk_start:chunk_end]
+            elif t_index is not None:
+                # Read full z-chunk for fixed t
+                chunk_data = dataset[t_index, chunk_start:chunk_end]
+            elif c_index is not None:
+                # Read full z-chunk for fixed c
+                chunk_data = dataset[c_index, chunk_start:chunk_end]
+            else:
+                # Read full z-chunk for 3D case
+                chunk_data = dataset[chunk_start:chunk_end]
+
+            # Yield individual z-slices from the cached chunk (memory access only)
+            for local_z in range(chunk_end - chunk_start):
+                yield chunk_data[local_z]
