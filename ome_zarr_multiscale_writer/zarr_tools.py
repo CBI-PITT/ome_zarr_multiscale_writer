@@ -486,7 +486,18 @@ class Live3DPyramidWriter:
         # Preserve existing level 0 when multiscales-only mode is requested
         if not self.write_level0 and self.arrs:
             if self.is_5d:
-                self.z_counts[0] = self.arrs[0].shape[2]  # z dimension is index 2 in 5D
+                # For 5D, initialize z_counts_5d with existing array dimensions
+                if not hasattr(self, "_z_counts_5d"):
+                    self._z_counts_5d = {}
+                # Initialize all (t,c) combinations with the existing z size
+                existing_z_size = self.arrs[0].shape[2]  # z dimension is index 2 in 5D
+                for t_idx in range(self.spec.t_size):
+                    for c_idx in range(self.spec.c_size):
+                        key = (t_idx, c_idx)
+                        self._z_counts_5d[key] = [0] * self.levels
+                        self._z_counts_5d[key][0] = existing_z_size
+                # Also update the legacy z_counts for compatibility
+                self.z_counts[0] = existing_z_size
             else:
                 self.z_counts[0] = self.arrs[0].shape[0]  # z dimension is index 0 in 3D
 
@@ -598,10 +609,15 @@ class Live3DPyramidWriter:
             if l == 0 and not self.write_level0:
                 continue
             if self.is_5d:
-                # 5D arrays: (t, c, z, y, x) -> resize z dimension
-                a.resize(
-                    (a.shape[0], a.shape[1], self.z_counts[l], a.shape[3], a.shape[4])
-                )
+                # 5D arrays: find maximum z count across all (t,c) combinations
+                max_z_count = 0
+                if hasattr(self, "_z_counts_5d"):
+                    for (t_idx, c_idx), counts in self._z_counts_5d.items():
+                        max_z_count = max(max_z_count, counts[l])
+                else:
+                    # Fallback to regular z_counts if 5D not initialized
+                    max_z_count = self.z_counts[l]
+                a.resize((a.shape[0], a.shape[1], max_z_count, a.shape[3], a.shape[4]))
             else:
                 # 3D arrays: (z, y, x) -> traditional resize
                 a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
@@ -638,10 +654,15 @@ class Live3DPyramidWriter:
             if l == 0 and not self.write_level0:
                 continue
             if self.is_5d:
-                # 5D arrays: (t, c, z, y, x) -> resize z dimension
-                a.resize(
-                    (a.shape[0], a.shape[1], self.z_counts[l], a.shape[3], a.shape[4])
-                )
+                # 5D arrays: find maximum z count across all (t,c) combinations
+                max_z_count = 0
+                if hasattr(self, "_z_counts_5d"):
+                    for (t_idx, c_idx), counts in self._z_counts_5d.items():
+                        max_z_count = max(max_z_count, counts[l])
+                else:
+                    # Fallback to regular z_counts if 5D not initialized
+                    max_z_count = self.z_counts[l]
+                a.resize((a.shape[0], a.shape[1], max_z_count, a.shape[3], a.shape[4]))
             else:
                 # 3D arrays: (z, y, x) -> traditional resize
                 a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
@@ -659,29 +680,63 @@ class Live3DPyramidWriter:
     # ---------- Internals ----------
 
     def _flush_pair_tails_all_the_way(self):
-        if not hasattr(self, "_pair_buf"):
-            return
-        changed = True
-        while changed:
-            changed = False
-            for lvl in range(
-                max(1, self.xy_levels + 1), self.levels
-            ):  # start at first 3D level
-                buf = self._pair_buf[lvl]
-                if buf is None:
-                    continue
-                if self.flush_pad == FlushPad.DUPLICATE_LAST:
-                    tail = dsZ2_mean_uint16(buf, buf)
-                elif self.flush_pad == FlushPad.ZEROS:
-                    tail = dsZ2_mean_uint16(buf, np.zeros_like(buf, dtype=np.uint16))
-                else:  # DROP
+        if self.is_5d:
+            # Handle 5D pair buffers for each (t,c) combination
+            if not hasattr(self, "_pair_buf_5d"):
+                return
+            changed = True
+            while changed:
+                changed = False
+                for (t_index, c_index), pair_buf_list in self._pair_buf_5d.items():
+                    for lvl in range(
+                        max(1, self.xy_levels + 1), self.levels
+                    ):  # start at first 3D level
+                        buf = pair_buf_list[lvl]
+                        if buf is None:
+                            continue
+                        if self.flush_pad == FlushPad.DUPLICATE_LAST:
+                            tail = dsZ2_mean_uint16(buf, buf)
+                        elif self.flush_pad == FlushPad.ZEROS:
+                            tail = dsZ2_mean_uint16(
+                                buf, np.zeros_like(buf, dtype=np.uint16)
+                            )
+                        else:  # DROP
+                            pair_buf_list[lvl] = None
+                            continue
+                        pair_buf_list[lvl] = None
+                        zL = self._reserve_z(lvl, t_index, c_index)
+                        self._append_to_active_buffer(lvl, zL, tail, t_index, c_index)
+                        self._emit_next(
+                            lvl + 1, ds2_mean_uint16(tail), t_index, c_index
+                        )
+                        changed = True
+        else:
+            # Legacy 3D mode
+            if not hasattr(self, "_pair_buf"):
+                return
+            changed = True
+            while changed:
+                changed = False
+                for lvl in range(
+                    max(1, self.xy_levels + 1), self.levels
+                ):  # start at first 3D level
+                    buf = self._pair_buf[lvl]
+                    if buf is None:
+                        continue
+                    if self.flush_pad == FlushPad.DUPLICATE_LAST:
+                        tail = dsZ2_mean_uint16(buf, buf)
+                    elif self.flush_pad == FlushPad.ZEROS:
+                        tail = dsZ2_mean_uint16(
+                            buf, np.zeros_like(buf, dtype=np.uint16)
+                        )
+                    else:  # DROP
+                        self._pair_buf[lvl] = None
+                        continue
                     self._pair_buf[lvl] = None
-                    continue
-                self._pair_buf[lvl] = None
-                zL = self._reserve_z(lvl)
-                self._append_to_active_buffer(lvl, zL, tail)
-                self._emit_next(lvl + 1, ds2_mean_uint16(tail))
-                changed = True
+                    zL = self._reserve_z(lvl)
+                    self._append_to_active_buffer(lvl, zL, tail)
+                    self._emit_next(lvl + 1, ds2_mean_uint16(tail))
+                    changed = True
 
     def _consume(self):
         while True:
@@ -690,10 +745,24 @@ class Live3DPyramidWriter:
                 break
             self._ingest_raw(item)
 
-    def _reserve_z(self, level: int) -> int:
-        z = self.z_counts[level]
-        self.z_counts[level] += 1
-        return z
+    def _reserve_z(self, level: int, t_index: int = 0, c_index: int = 0) -> int:
+        if self.is_5d:
+            # For 5D data, track z counts per (t,c) combination
+            if not hasattr(self, "_z_counts_5d"):
+                self._z_counts_5d = {}  # Dict[(t,c) -> List[int]]
+
+            key = (t_index, c_index)
+            if key not in self._z_counts_5d:
+                self._z_counts_5d[key] = [0] * self.levels
+
+            z = self._z_counts_5d[key][level]
+            self._z_counts_5d[key][level] += 1
+            return z
+        else:
+            # Legacy 3D mode: single z count per level
+            z = self.z_counts[level]
+            self.z_counts[level] += 1
+            return z
 
     def _submit_write_chunk(
         self, level: int, z0: int, buf3d: np.ndarray, t_index: int = 0, c_index: int = 0
@@ -841,7 +910,7 @@ class Live3DPyramidWriter:
                         for z_idx, zplane in enumerate(img0):
                             # Level 0: optionally write into active chunk
                             if self.write_level0:
-                                z0 = self._reserve_z(0)
+                                z0 = self._reserve_z(0, t_index, c_index)
                                 self._append_to_active_buffer(
                                     0, z0, zplane, t_index, c_index
                                 )
@@ -858,7 +927,7 @@ class Live3DPyramidWriter:
                         # Process 2D data (y, x)
                         # Level 0: optionally write into active chunk
                         if self.write_level0:
-                            z0 = self._reserve_z(0)
+                            z0 = self._reserve_z(0, t_index, c_index)
                             self._append_to_active_buffer(0, z0, img0, t_index, c_index)
 
                         # Build and cascade upper levels (true 3D, factor 2^L)
@@ -891,7 +960,7 @@ class Live3DPyramidWriter:
 
         if level <= self.xy_levels:
             # XY-only stage: append every incoming slice (no Z pairing)
-            zL = self._reserve_z(level)
+            zL = self._reserve_z(level, t_index, c_index)
             self._append_to_active_buffer(level, zL, candidate_xy, t_index, c_index)
             # continue XY decimation upward
             self._emit_next(level + 1, ds2_mean_uint16(candidate_xy), t_index, c_index)
@@ -923,7 +992,7 @@ class Live3DPyramidWriter:
             out_3d = dsZ2_mean_uint16(buf, candidate_xy)
             self._pair_buf[level] = None
 
-        zL = self._reserve_z(level)
+        zL = self._reserve_z(level, t_index, c_index)
         self._append_to_active_buffer(level, zL, out_3d, t_index, c_index)
 
         # propagate upward with further XY decimation
