@@ -29,3 +29,11 @@
 ## Security & Configuration Tips
 - Avoid committing paths to external storage (e.g., lab share mounts); use placeholders in examples.
 - Keep dependencies minimal—`zarr` (and its transitive `numcodecs`) are required. If you add optional extras, guard imports and document flags clearly.
+
+## OME-Zarr Specific Guidelines
+- Adhere to OME-Zarr specs for multiscale pyramids; validate output with tools like `ome-zarr-models`.
+- When implementing downsampling, ensure correct handling of voxel sizes and metadata propagation.
+- Document any deviations from standard OME-Zarr practices and justify them in code
+- Ome-Zarr 0.5 documentation can be found at: https://ngff.openmicroscopy.org/0.5/
+- Ome-Zarr 0.4 documentation can be found at: https://ngff.openmicroscopy.org/0.4/
+- Writer and reader should maintain compatibility with ome-zarr specifications 0.4 and 0.5.
