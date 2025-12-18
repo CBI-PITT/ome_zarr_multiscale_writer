@@ -523,3 +523,7 @@ if __name__ == "__main__":
         print(f"Shape with timepoint lock: {ome_array.shape}")
     except ValueError as e:
         print(e)
+
+    # Example usage
+    mesospim_ome_zarr_path = r"Z:\Acquire\MesoSPIM\alan-test\spinal cord 16x\spinal_cord_16x_Mag16x_Ch561.ome.zarr\s25-t0.zarr"  # Replace with your OME-Zarr path
+    mesospim_ome_array = OmeZarrArray(mesospim_ome_zarr_path)

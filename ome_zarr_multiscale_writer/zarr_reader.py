@@ -1,13 +1,17 @@
 import zarr
 import numpy as np
-from typing import List, Dict, Any, cast, Union, Tuple, Any as TypingAny
+from typing import List, Dict, Any, cast, Union, Tuple, Any as TypingAny, Optional
 from zarr import Array
+from ome_zarr_models import open_ome_zarr
+from ome_zarr_models.v05.image import Image as ImageV05
+from ome_zarr_models.v04.image import Image as ImageV04
 
 
 class OmeZarrArray:
     """Convenience class for accessing OME-Zarr v0.4/v0.5 arrays with resolution selection."""
 
     def __init__(self, store_path: str) -> None:
+        self.store_path = store_path
         self.store = zarr.open(store_path, mode="r")
 
         # Try OME-Zarr 0.5 format first (metadata under 'ome' key)
@@ -135,15 +139,10 @@ class OmeZarrArray:
             return dataset.compressors
         return None
 
-    def nchunks(self, compute: bool = False) -> int:
-        """Number of chunks physically written to disk. Set compute=True to force computation."""
-        if compute:
-            return self._get_dataset().nchunks_initialized
-        else:
-            raise ValueError(
-                "nchunks requires filesystem access which can be slow. "
-                "Use nchunks(compute=True) to force computation."
-            )
+    @property
+    def nchunks(self) -> int:
+        """Number of chunks physically written to disk (property access)."""
+        return self._get_dataset().nchunks_initialized
 
     @property
     def cdata_shape(self) -> tuple:
@@ -218,9 +217,73 @@ class OmeZarrArray:
     def print_chunk_info(self) -> None:
         """Print number of initialized chunks out of total chunks for current resolution level."""
         dataset = self._get_dataset()
-        initialized = self.nchunks(compute=True)
+        initialized = self.nchunks
         total = self.total_chunks
         print(f"Initialized chunks: {initialized} / {total}")
+
+    @staticmethod
+    def validate_ome_zarr_path(
+        store_path: str, detailed_errors: bool = False
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validate if the OME-Zarr store at the given path is up to spec.
+
+        Args:
+            store_path: Path to the OME-Zarr store
+            detailed_errors: If True, return detailed error messages
+
+        Returns:
+            Tuple of (is_valid, error_message)
+            - is_valid: Boolean indicating if valid OME-Zarr
+            - error_message: None if valid, otherwise error description
+        """
+        try:
+            # Open the zarr group for validation
+            zarr_group = zarr.open_group(store_path, mode="r")
+
+            # Try OME-Zarr 0.5 validation first
+            try:
+                ImageV05.from_zarr(zarr_group)
+                return True, None
+            except Exception:
+                pass
+
+            # Try OME-Zarr 0.4 validation
+            try:
+                ImageV04.from_zarr(zarr_group)
+                return True, None
+            except Exception:
+                pass
+
+            # Try auto-detection as fallback
+            try:
+                open_ome_zarr(zarr_group)
+                return True, None
+            except Exception as e:
+                error_msg = (
+                    str(e)
+                    if detailed_errors
+                    else f"Validation failed: {type(e).__name__}"
+                )
+                return False, error_msg
+
+        except Exception as e:
+            error_msg = (
+                str(e)
+                if detailed_errors
+                else f"Failed to open store: {type(e).__name__}"
+            )
+            return False, error_msg
+
+    @property
+    def is_valid_ome_zarr(self) -> bool:
+        """Convenience property to check if currently opened array is valid OME-Zarr."""
+        return self.validate_ome_zarr_path(self.store_path)[0]
+
+    @property
+    def validation_error(self) -> Optional[str]:
+        """Convenience property to get validation error message for current array."""
+        return self.validate_ome_zarr_path(self.store_path, detailed_errors=True)[1]
 
     def __iter__(self):
         dataset = self._get_dataset()
