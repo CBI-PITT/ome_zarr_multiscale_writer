@@ -135,13 +135,23 @@ class OmeZarrArray:
             return dataset.compressors
         return None
 
-    @property
-    def nchunks(self) -> int:
-        return self._get_dataset().nchunks_initialized
+    def nchunks(self, compute: bool = False) -> int:
+        """Number of chunks physically written to disk. Set compute=True to force computation."""
+        if compute:
+            return self._get_dataset().nchunks_initialized
+        else:
+            raise ValueError(
+                "nchunks requires filesystem access which can be slow. "
+                "Use nchunks(compute=True) to force computation."
+            )
 
     @property
     def cdata_shape(self) -> tuple:
         return self._get_dataset().cdata_shape
+
+    @property
+    def total_chunks(self) -> int:
+        return int(np.prod(self.cdata_shape))
 
     @property
     def axes(self) -> List[Dict[str, Any]]:
@@ -204,6 +214,13 @@ class OmeZarrArray:
                     )
                     key = key[:time_idx] + (self._timepoint_lock,) + key[time_idx + 1 :]
         return dataset[key]
+
+    def print_chunk_info(self) -> None:
+        """Print number of initialized chunks out of total chunks for current resolution level."""
+        dataset = self._get_dataset()
+        initialized = self.nchunks(compute=True)
+        total = self.total_chunks
+        print(f"Initialized chunks: {initialized} / {total}")
 
     def __iter__(self):
         dataset = self._get_dataset()
