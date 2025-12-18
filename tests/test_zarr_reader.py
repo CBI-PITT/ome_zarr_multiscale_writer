@@ -455,7 +455,7 @@ def test_timepoint_lock_with_resolution_levels():
     # Create simple 2-timepoint dataset
     store = zarr.open(str(store_path), mode="w")
     for t in range(2):
-        store.create_dataset(str(t), data=data[t], chunks=(8, 16, 16))
+        store.create_dataset(str(t), data=data[t], shape=(16, 16), chunks=(8, 16, 16))
 
     multiscales = [
         {
@@ -506,6 +506,7 @@ def test_timepoint_lock_with_resolution_levels():
 
     finally:
         OmeZarrArray._get_dataset = original_get_dataset
+
 
 if __name__ == "__main__":
     # Example usage
