@@ -123,6 +123,10 @@ class OmeZarrArray:
         return shape
 
     @property
+    def ome(self) -> float:
+        return float(self._ome_version)
+
+    @property
     def dtype(self) -> np.dtype:
         return self._get_dataset().dtype
 
