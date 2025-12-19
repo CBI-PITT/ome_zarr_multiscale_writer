@@ -15,6 +15,14 @@ class OmeZarrArray:
     def __init__(self, store_path: str) -> None:
         self.store_path = store_path
         self.store = zarr.open(store_path, mode="a")
+        self._get_multiscale_metadata()
+        self._resolution_level: int = 0
+        self._timepoint_lock: int | None = None
+
+    def _get_multiscale_metadata(self) -> Dict[str, Any]:
+        self._axes = None
+        self._scale_datasets = None
+        self._ome_version = None
 
         # Try OME-Zarr 0.5 format first (metadata under 'ome' key)
         multiscales = None
@@ -31,9 +39,9 @@ class OmeZarrArray:
 
         # Extract axes metadata if present
         if (
-            isinstance(multiscales, list)
-            and len(multiscales) > 0
-            and isinstance(multiscales[0], dict)
+                isinstance(multiscales, list)
+                and len(multiscales) > 0
+                and isinstance(multiscales[0], dict)
         ):
             multiscales_dict = multiscales[0]
             self._axes = cast(List[Dict[str, Any]], multiscales_dict.get("axes", []))
@@ -45,11 +53,10 @@ class OmeZarrArray:
             self._scale_datasets = []
         if not self._scale_datasets:
             raise ValueError("Invalid multiscales: missing datasets")
-        self._resolution_level: int = 0
-        self._timepoint_lock: int | None = None
 
         # Store OME version for consistency in create_multiscales
         self._ome_version = "0.5" if ome and isinstance(ome, dict) else "0.4"
+
 
     def _get_dataset(self) -> Array:
         """Get the current resolution level's dataset."""
@@ -546,6 +553,8 @@ class OmeZarrArray:
             return str(target_path)
 
         finally:
+            # Reload multiscale metadata
+            self._get_multiscale_metadata()
             # Restore original resolution level
             self.resolution_level = original_level
 
