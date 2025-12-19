@@ -39,9 +39,9 @@ class OmeZarrArray:
 
         # Extract axes metadata if present
         if (
-                isinstance(multiscales, list)
-                and len(multiscales) > 0
-                and isinstance(multiscales[0], dict)
+            isinstance(multiscales, list)
+            and len(multiscales) > 0
+            and isinstance(multiscales[0], dict)
         ):
             multiscales_dict = multiscales[0]
             self._axes = cast(List[Dict[str, Any]], multiscales_dict.get("axes", []))
@@ -56,7 +56,6 @@ class OmeZarrArray:
 
         # Store OME version for consistency in create_multiscales
         self._ome_version = "0.5" if ome and isinstance(ome, dict) else "0.4"
-
 
     def _get_dataset(self) -> Array:
         """Get the current resolution level's dataset."""
@@ -161,8 +160,10 @@ class OmeZarrArray:
     def voxel_size(self) -> tuple:
         """Get voxel size from OME-Zarr metadata axes."""
         resolution_metadata = self._scale_datasets[self.resolution_level]
-        coordinate_transforms = resolution_metadata.get("coordinateTransformations", [])[0]
-        if isinstance(coordinate_transforms,dict):
+        coordinate_transforms = resolution_metadata.get(
+            "coordinateTransformations", []
+        )[0]
+        if isinstance(coordinate_transforms, dict):
             if coordinate_transforms.get("type") == "scale":
                 scale = coordinate_transforms.get("scale", [])
                 if len(scale) >= 3:
@@ -378,12 +379,10 @@ class OmeZarrArray:
                     f"Unsupported array dimensionality: {len(full_res_shape)}D"
                 )
 
-
             if levels is None and self.ResolutionLevels == 1:
                 levels = 5  # Default to 5 levels if none exist
             elif levels is None and self.ResolutionLevels > 1:
                 levels = self.ResolutionLevels  # Use existing number of levels
-
 
             # Create PyramidSpec
             spec = PyramidSpec(
@@ -395,7 +394,6 @@ class OmeZarrArray:
                 c_size=c_size,
             )
 
-
             # Set chunks for new multiscales
             chunk_scheme = None
             if start_chunks is None and end_chunks is None:
@@ -404,7 +402,9 @@ class OmeZarrArray:
                     chunks_per_level = []
                     for l in range(levels):
                         self.resolution_level = l
-                        chunks_per_level.append(self.chunks)  # Will throw error if level missing
+                        chunks_per_level.append(
+                            self.chunks
+                        )  # Will throw error if level missing
                     chunk_scheme = ChunkScheme(hard_coded=chunks_per_level)
                 except:
                     chunks_per_level = []
@@ -413,17 +413,21 @@ class OmeZarrArray:
 
             if chunk_scheme is None:
                 if not start_chunks:
-                    self.resolution_level = 0 # get chunks for res 0
+                    self.resolution_level = 0  # get chunks for res 0
                     start_chunks = self.chunks
 
                 if not end_chunks and self.ResolutionLevels > 1:
-                    self.resolution_level = self.ResolutionLevels - 1 # get chunks for last res
+                    self.resolution_level = (
+                        self.ResolutionLevels - 1
+                    )  # get chunks for last res
                     try:
                         end_chunks = self.chunks
                     except KeyError:
-                        print('The last multiscale is missing, it may have been deleted. Ending chunks is being sent to same value as Resolution Level 0.')
+                        print(
+                            "The last multiscale is missing, it may have been deleted. Ending chunks is being sent to same value as Resolution Level 0."
+                        )
                         end_chunks = start_chunks
-                    self.resolution_level = 0 # Restore to res 0
+                    self.resolution_level = 0  # Restore to res 0
                 if not end_chunks:
                     # If only one level exists, set default end chunks
                     end_chunks = (256, 256, 256)
@@ -432,7 +436,7 @@ class OmeZarrArray:
 
             # Set up compressor if specified
             if not compressor:
-                compressor_obj = self.compressor # Use existing compressor
+                compressor_obj = self.compressor  # Use existing compressor
             else:
                 if compressor == "zstd":
                     from zarr.codecs import BloscCodec, BloscShuffle
@@ -458,7 +462,7 @@ class OmeZarrArray:
                 # Try to get from metadata, otherwise use default
                 voxel_size = self.voxel_size
             if len(voxel_size) == 0:
-                voxel_size = (1.0,1.0,1.0) # default fallback
+                voxel_size = (1.0, 1.0, 1.0)  # default fallback
 
             # Determine target path
             if target_path is None:
@@ -561,6 +565,17 @@ class OmeZarrArray:
             self._get_multiscale_metadata()
             # Restore original resolution level
             self.resolution_level = original_level
+
+    def __repr__(self) -> str:
+        """Simple representation of OME-Zarr multiscale array."""
+        return (
+            f"OmeZarrArray({self.store_path}) "
+            f"shape={self.shape} "
+            f"dtype={self.dtype} "
+            f"levels={self.ResolutionLevels} "
+            f"current_level={self.resolution_level} "
+            f"ome_v{self._ome_version}"
+        )
 
     def __iter__(self):
         dataset = self._get_dataset()
