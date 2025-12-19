@@ -577,6 +577,20 @@ class OmeZarrArray:
             f"ome_v{self._ome_version}"
         )
 
+    @property
+    def summary(self) -> str:
+        """Brief summary of all resolution levels in repr-style format."""
+
+        current_resolution = self.resolution_level
+        for l in range(self.ResolutionLevels):
+            self.resolution_level = l
+            dataset = self._get_dataset()
+            message = f"Level {l}: shape={dataset.shape}, chunks={dataset.chunks}, dtype={dataset.dtype}"
+            if l == current_resolution:
+                message += " <-- CURRENT LEVEL"
+            print(message)
+        self.resolution_level = current_resolution
+
     def __iter__(self):
         dataset = self._get_dataset()
         if self._timepoint_lock is not None:
