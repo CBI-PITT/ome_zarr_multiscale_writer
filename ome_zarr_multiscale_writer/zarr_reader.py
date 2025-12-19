@@ -43,13 +43,13 @@ class OmeZarrArray:
         else:
             self._axes = []
             self._scale_datasets = []
-            raise ValueError(
-                "Invalid multiscales format: expected list with dict as first element"
-            )
         if not self._scale_datasets:
             raise ValueError("Invalid multiscales: missing datasets")
         self._resolution_level: int = 0
         self._timepoint_lock: int | None = None
+
+        # Store OME version for consistency in create_multiscales
+        self._ome_version = "0.5" if ome and isinstance(ome, dict) else "0.4"
 
     def _get_dataset(self) -> Array:
         """Get the current resolution level's dataset."""
@@ -397,7 +397,7 @@ class OmeZarrArray:
             # Create chunk scheme
             chunk_scheme = ChunkScheme(base=start_chunks, target=end_chunks)
 
-            # Set up Live3DPyramidWriter
+            # Set up Live3DPyramidWriter with consistent OME version
             writer = Live3DPyramidWriter(
                 spec=spec,
                 voxel_size=voxel_size,
@@ -405,6 +405,7 @@ class OmeZarrArray:
                 chunk_scheme=chunk_scheme,
                 compressor=compressor_obj,
                 flush_pad=flush_pad,
+                ome_version=self._ome_version,
                 **kwargs,
             )
 
