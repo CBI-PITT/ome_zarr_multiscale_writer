@@ -14,7 +14,7 @@ class OmeZarrArray:
 
     def __init__(self, store_path: str) -> None:
         self.store_path = store_path
-        self.store = zarr.open(store_path, mode="r")
+        self.store = zarr.open(store_path, mode="a")
 
         # Try OME-Zarr 0.5 format first (metadata under 'ome' key)
         multiscales = None
@@ -145,6 +145,20 @@ class OmeZarrArray:
     def nchunks(self) -> int:
         """Number of chunks physically written to disk (property access)."""
         return self._get_dataset().nchunks_initialized
+
+    @property
+    def voxel_size(self) -> tuple:
+        """Get voxel size from OME-Zarr metadata axes."""
+        resolution_metadata = self._scale_datasets[self.resolution_level]
+        coordinate_transforms = resolution_metadata.get("coordinateTransformations", [])[0]
+        if isinstance(coordinate_transforms,dict):
+            if coordinate_transforms.get("type") == "scale":
+                scale = coordinate_transforms.get("scale", [])
+                if len(scale) >= 3:
+                    return tuple(scale[-3:])  # Return last three values (z,y,x)
+                else:
+                    return ()
+        return ()
 
     @property
     def cdata_shape(self) -> tuple:
@@ -291,14 +305,12 @@ class OmeZarrArray:
         self,
         target_path: Optional[Union[str, Path]] = None,
         voxel_size: Optional[Tuple[float, float, float]] = None,
-        levels: int = 4,
-        start_chunks: Tuple[int, int, int] = (32, 512, 512),
-        end_chunks: Tuple[int, int, int] = (256, 256, 256),
-        compressor: str = "zstd",
+        levels: Optional[int] = None,
+        start_chunks: Optional[Tuple[int, int, int]] = None,
+        end_chunks: Optional[Tuple[int, int, int]] = None,
+        compressor: Optional[str] = None,
         compression_level: int = 5,
         flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
-        force: bool = False,
-        preserve_level0: bool = True,
         **kwargs,
     ) -> str:
         """
@@ -317,9 +329,6 @@ class OmeZarrArray:
             compressor: Compressor name (e.g., 'zstd', 'lz4').
             compression_level: Compression level for the compressor.
             flush_pad: How to handle partially filled chunks.
-            force: If True, recreates multiscales even if they already exist.
-            preserve_level0: If True and target_path is None, preserves existing level 0 data
-                           when recreating multiscales. Default is True.
             **kwargs: Additional arguments passed to Live3DPyramidWriter.
 
         Returns:
@@ -358,6 +367,13 @@ class OmeZarrArray:
                     f"Unsupported array dimensionality: {len(full_res_shape)}D"
                 )
 
+
+            if levels is None and self.ResolutionLevels == 1:
+                levels = 5  # Default to 5 levels if none exist
+            elif levels is None and self.ResolutionLevels > 1:
+                levels = self.ResolutionLevels  # Use existing number of levels
+
+
             # Create PyramidSpec
             spec = PyramidSpec(
                 z_size_estimate=z_size,
@@ -368,42 +384,89 @@ class OmeZarrArray:
                 c_size=c_size,
             )
 
+
+            # Set chunks for new multiscales
+            chunk_scheme = None
+            if start_chunks is None and end_chunks is None:
+                # Determine chunk_scheme based on existing levels if available
+                try:
+                    chunks_per_level = []
+                    for l in range(levels):
+                        self.resolution_level = l
+                        chunks_per_level.append(self.chunks)  # Will throw error if level missing
+                    chunk_scheme = ChunkScheme(hard_coded=chunks_per_level)
+                except:
+                    chunks_per_level = []
+                finally:
+                    self.resolution_level = 0
+
+            if chunk_scheme is None:
+                if not start_chunks:
+                    self.resolution_level = 0 # get chunks for res 0
+                    start_chunks = self.chunks
+
+                if not end_chunks and self.ResolutionLevels > 1:
+                    self.resolution_level = self.ResolutionLevels - 1 # get chunks for last res
+                    try:
+                        end_chunks = self.chunks
+                    except KeyError:
+                        print('The last multiscale is missing, it may have been deleted. Ending chunks is being sent to same value as Resolution Level 0.')
+                        end_chunks = start_chunks
+                    self.resolution_level = 0 # Restore to res 0
+                if not end_chunks:
+                    # If only one level exists, set default end chunks
+                    end_chunks = (256, 256, 256)
+
+                chunk_scheme = ChunkScheme(base=start_chunks, target=end_chunks)
+
             # Set up compressor if specified
-            if compressor == "zstd":
-                from zarr.codecs import BloscCodec, BloscShuffle
-
-                compressor_obj = BloscCodec(
-                    cname="zstd",
-                    clevel=compression_level,
-                    shuffle=BloscShuffle.bitshuffle,
-                )
-            elif compressor == "lz4":
-                from zarr.codecs import BloscCodec, BloscShuffle
-
-                compressor_obj = BloscCodec(
-                    cname="lz4",
-                    clevel=compression_level,
-                    shuffle=BloscShuffle.bitshuffle,
-                )
+            if not compressor:
+                compressor_obj = self.compressor # Use existing compressor
             else:
-                compressor_obj = None
+                if compressor == "zstd":
+                    from zarr.codecs import BloscCodec, BloscShuffle
+
+                    compressor_obj = BloscCodec(
+                        cname="zstd",
+                        clevel=compression_level,
+                        shuffle=BloscShuffle.bitshuffle,
+                    )
+                elif compressor == "lz4":
+                    from zarr.codecs import BloscCodec, BloscShuffle
+
+                    compressor_obj = BloscCodec(
+                        cname="lz4",
+                        clevel=compression_level,
+                        shuffle=BloscShuffle.bitshuffle,
+                    )
+                else:
+                    compressor_obj = None
 
             # Infer voxel size if not provided
             if voxel_size is None:
                 # Try to get from metadata, otherwise use default
-                voxel_size = (1.0, 1.0, 1.0)  # Default fallback
+                voxel_size = self.voxel_size
+            if len(voxel_size) == 0:
+                voxel_size = (1.0,1.0,1.0) # default fallback
 
             # Determine target path
             if target_path is None:
                 target_path = self.store_path
-                # When recreating multiscales in place, preserve level 0 if requested
-                write_level0 = not preserve_level0
+
+                # Delete existing multiscale levels except level 0
+                if len(self._scale_datasets) > 1:
+                    for i in range(
+                        1, len(self._scale_datasets)
+                    ):  # Skip level 0 (index 0)
+                        level_path = self._scale_datasets[i]["path"]
+                        if level_path in self.store:
+                            del self.store[level_path]
+
+                # Do not write level 0 again to preserve level0 data when overwriting in place
+                write_level0 = False
             else:
                 # When writing to a new path, always write level 0
                 write_level0 = True
-
-            # Create chunk scheme
-            chunk_scheme = ChunkScheme(base=start_chunks, target=end_chunks)
 
             # Set up Live3DPyramidWriter with consistent OME version
             writer = Live3DPyramidWriter(

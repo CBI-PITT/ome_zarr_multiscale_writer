@@ -73,6 +73,7 @@ class ChunkScheme:
 
     base: Tuple[int, int, int] = (1, 1024, 1024)  # (z, y, x) at level 0
     target: Tuple[int, int, int] = (64, 64, 64)  # desired asymptote
+    hard_coded: List[Tuple[int, int, int]] = None
 
     def chunks_for_level(
         self, level: int, zyx_level_shape: Tuple[int, int, int]
@@ -81,6 +82,8 @@ class ChunkScheme:
         bz, by, bx = self.base
         tz, ty, tx = self.target
 
+        if self.hard_coded:
+            return self.hard_coded[level]
         # Determine if chunks should grow or shrink based on base vs target
         if bz <= tz:
             # z chunks should grow from base to target
