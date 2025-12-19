@@ -298,6 +298,7 @@ class OmeZarrArray:
         compression_level: int = 5,
         flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
         force: bool = False,
+        preserve_level0: bool = True,
         **kwargs,
     ) -> str:
         """
@@ -317,6 +318,8 @@ class OmeZarrArray:
             compression_level: Compression level for the compressor.
             flush_pad: How to handle partially filled chunks.
             force: If True, recreates multiscales even if they already exist.
+            preserve_level0: If True and target_path is None, preserves existing level 0 data
+                           when recreating multiscales. Default is True.
             **kwargs: Additional arguments passed to Live3DPyramidWriter.
 
         Returns:
@@ -393,6 +396,11 @@ class OmeZarrArray:
             # Determine target path
             if target_path is None:
                 target_path = self.store_path
+                # When recreating multiscales in place, preserve level 0 if requested
+                write_level0 = not preserve_level0
+            else:
+                # When writing to a new path, always write level 0
+                write_level0 = True
 
             # Create chunk scheme
             chunk_scheme = ChunkScheme(base=start_chunks, target=end_chunks)
@@ -406,6 +414,7 @@ class OmeZarrArray:
                 compressor=compressor_obj,
                 flush_pad=flush_pad,
                 ome_version=self._ome_version,
+                write_level0=write_level0,
                 **kwargs,
             )
 
