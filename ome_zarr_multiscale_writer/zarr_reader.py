@@ -5,6 +5,8 @@ from zarr import Array
 from ome_zarr_models import open_ome_zarr
 from ome_zarr_models.v05.image import Image as ImageV05
 from ome_zarr_models.v04.image import Image as ImageV04
+from pathlib import Path
+from .zarr_tools import Live3DPyramidWriter, PyramidSpec, ChunkScheme, FlushPad
 
 
 class OmeZarrArray:
@@ -12,7 +14,15 @@ class OmeZarrArray:
 
     def __init__(self, store_path: str) -> None:
         self.store_path = store_path
-        self.store = zarr.open(store_path, mode="r")
+        self.store = zarr.open(store_path, mode="a")
+        self._get_multiscale_metadata()
+        self._resolution_level: int = 0
+        self._timepoint_lock: int | None = None
+
+    def _get_multiscale_metadata(self) -> Dict[str, Any]:
+        self._axes = None
+        self._scale_datasets = None
+        self._ome_version = None
 
         # Try OME-Zarr 0.5 format first (metadata under 'ome' key)
         multiscales = None
@@ -41,13 +51,11 @@ class OmeZarrArray:
         else:
             self._axes = []
             self._scale_datasets = []
-            raise ValueError(
-                "Invalid multiscales format: expected list with dict as first element"
-            )
         if not self._scale_datasets:
             raise ValueError("Invalid multiscales: missing datasets")
-        self._resolution_level: int = 0
-        self._timepoint_lock: int | None = None
+
+        # Store OME version for consistency in create_multiscales
+        self._ome_version = "0.5" if ome and isinstance(ome, dict) else "0.4"
 
     def _get_dataset(self) -> Array:
         """Get the current resolution level's dataset."""
@@ -114,6 +122,10 @@ class OmeZarrArray:
         return shape
 
     @property
+    def ome(self) -> float:
+        return float(self._ome_version)
+
+    @property
     def dtype(self) -> np.dtype:
         return self._get_dataset().dtype
 
@@ -143,6 +155,22 @@ class OmeZarrArray:
     def nchunks(self) -> int:
         """Number of chunks physically written to disk (property access)."""
         return self._get_dataset().nchunks_initialized
+
+    @property
+    def voxel_size(self) -> tuple:
+        """Get voxel size from OME-Zarr metadata axes."""
+        resolution_metadata = self._scale_datasets[self.resolution_level]
+        coordinate_transforms = resolution_metadata.get(
+            "coordinateTransformations", []
+        )[0]
+        if isinstance(coordinate_transforms, dict):
+            if coordinate_transforms.get("type") == "scale":
+                scale = coordinate_transforms.get("scale", [])
+                if len(scale) >= 3:
+                    return tuple(scale[-3:])  # Return last three values (z,y,x)
+                else:
+                    return ()
+        return ()
 
     @property
     def cdata_shape(self) -> tuple:
@@ -285,6 +313,284 @@ class OmeZarrArray:
         """Convenience property to get validation error message for current array."""
         return self.validate_ome_zarr_path(self.store_path, detailed_errors=True)[1]
 
+    def create_multiscales(
+        self,
+        target_path: Optional[Union[str, Path]] = None,
+        voxel_size: Optional[Tuple[float, float, float]] = None,
+        levels: Optional[int] = None,
+        start_chunks: Optional[Tuple[int, int, int]] = None,
+        end_chunks: Optional[Tuple[int, int, int]] = None,
+        compressor: Optional[str] = None,
+        compression_level: int = 5,
+        flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
+        **kwargs,
+    ) -> str:
+        """
+        Create or recreate multiscales from the full resolution data in this OmeZarrArray.
+
+        Uses Live3DPyramidWriter to generate a proper multiscale pyramid from the
+        highest resolution data (level 0) in the current array.
+
+        Args:
+            target_path: Optional destination path for the new multiscales.
+                        If None, recreates multiscales in the current store.
+            voxel_size: Physical voxel size (z, y, x). If None, attempts to infer from metadata.
+            levels: Number of pyramid levels to generate.
+            start_chunks: Chunk shape for level 0 (z, y, x).
+            end_chunks: Target chunk shape for coarsest level (z, y, x).
+            compressor: Compressor name (e.g., 'zstd', 'lz4').
+            compression_level: Compression level for the compressor.
+            flush_pad: How to handle partially filled chunks.
+            **kwargs: Additional arguments passed to Live3DPyramidWriter.
+
+        Returns:
+            Path to the store containing the created multiscales.
+
+        Raises:
+            ValueError: If the array doesn't contain level 0 data or other validation errors.
+        """
+        # Ensure we're working with level 0 (full resolution)
+        original_level = self.resolution_level
+        self.resolution_level = 0
+
+        try:
+            # Get the full resolution data shape
+            full_res_shape = self.shape
+
+            # Determine if this is 5D data (t, c, z, y, x) or 3D (z, y, x)
+            if len(full_res_shape) == 5:
+                t_size, c_size, z_size, y_size, x_size = full_res_shape
+            elif len(full_res_shape) == 4:
+                # Could be (t, z, y, x) or (c, z, y, x)
+                if self._has_time_axis():
+                    t_size = full_res_shape[0]
+                    c_size = 1
+                    z_size, y_size, x_size = full_res_shape[1:]
+                else:
+                    t_size = 1
+                    c_size = full_res_shape[0]
+                    z_size, y_size, x_size = full_res_shape[1:]
+            elif len(full_res_shape) == 3:
+                t_size = 1
+                c_size = 1
+                z_size, y_size, x_size = full_res_shape
+            else:
+                raise ValueError(
+                    f"Unsupported array dimensionality: {len(full_res_shape)}D"
+                )
+
+            if levels is None and self.ResolutionLevels == 1:
+                levels = 5  # Default to 5 levels if none exist
+            elif levels is None and self.ResolutionLevels > 1:
+                levels = self.ResolutionLevels  # Use existing number of levels
+
+            # Create PyramidSpec
+            spec = PyramidSpec(
+                z_size_estimate=z_size,
+                y=y_size,
+                x=x_size,
+                levels=levels,
+                t_size=t_size,
+                c_size=c_size,
+            )
+
+            # Set chunks for new multiscales
+            chunk_scheme = None
+            if start_chunks is None and end_chunks is None:
+                # Determine chunk_scheme based on existing levels if available
+                try:
+                    chunks_per_level = []
+                    for l in range(levels):
+                        self.resolution_level = l
+                        chunks_per_level.append(
+                            self.chunks
+                        )  # Will throw error if level missing
+                    chunk_scheme = ChunkScheme(hard_coded=chunks_per_level)
+                except:
+                    chunks_per_level = []
+                finally:
+                    self.resolution_level = 0
+
+            if chunk_scheme is None:
+                if not start_chunks:
+                    self.resolution_level = 0  # get chunks for res 0
+                    start_chunks = self.chunks
+
+                if not end_chunks and self.ResolutionLevels > 1:
+                    self.resolution_level = (
+                        self.ResolutionLevels - 1
+                    )  # get chunks for last res
+                    try:
+                        end_chunks = self.chunks
+                    except KeyError:
+                        print(
+                            "The last multiscale is missing, it may have been deleted. Ending chunks is being sent to same value as Resolution Level 0."
+                        )
+                        end_chunks = start_chunks
+                    self.resolution_level = 0  # Restore to res 0
+                if not end_chunks:
+                    # If only one level exists, set default end chunks
+                    end_chunks = (256, 256, 256)
+
+                chunk_scheme = ChunkScheme(base=start_chunks, target=end_chunks)
+
+            # Set up compressor if specified
+            if not compressor:
+                compressor_obj = self.compressor  # Use existing compressor
+            else:
+                if compressor == "zstd":
+                    from zarr.codecs import BloscCodec, BloscShuffle
+
+                    compressor_obj = BloscCodec(
+                        cname="zstd",
+                        clevel=compression_level,
+                        shuffle=BloscShuffle.bitshuffle,
+                    )
+                elif compressor == "lz4":
+                    from zarr.codecs import BloscCodec, BloscShuffle
+
+                    compressor_obj = BloscCodec(
+                        cname="lz4",
+                        clevel=compression_level,
+                        shuffle=BloscShuffle.bitshuffle,
+                    )
+                else:
+                    compressor_obj = None
+
+            # Infer voxel size if not provided
+            if voxel_size is None:
+                # Try to get from metadata, otherwise use default
+                voxel_size = self.voxel_size
+            if len(voxel_size) == 0:
+                voxel_size = (1.0, 1.0, 1.0)  # default fallback
+
+            # Determine target path
+            if target_path is None:
+                target_path = self.store_path
+
+                # Delete existing multiscale levels except level 0
+                if len(self._scale_datasets) > 1:
+                    for i in range(
+                        1, len(self._scale_datasets)
+                    ):  # Skip level 0 (index 0)
+                        level_path = self._scale_datasets[i]["path"]
+                        if level_path in self.store:
+                            del self.store[level_path]
+
+                # Do not write level 0 again to preserve level0 data when overwriting in place
+                write_level0 = False
+            else:
+                # When writing to a new path, always write level 0
+                write_level0 = True
+
+            # Set up Live3DPyramidWriter with consistent OME version
+            writer = Live3DPyramidWriter(
+                spec=spec,
+                voxel_size=voxel_size,
+                path=target_path,
+                chunk_scheme=chunk_scheme,
+                compressor=compressor_obj,
+                flush_pad=flush_pad,
+                ome_version=self._ome_version,
+                write_level0=write_level0,
+                **kwargs,
+            )
+
+            # Stream the data
+            with writer:
+                if t_size == 1 and c_size == 1:
+                    # 3D case: stream z slices using chunked generator
+                    for slice_data in self._chunked_z_slices():
+                        writer.push_slice(slice_data)
+                else:
+                    # 5D case: handle time and channels
+                    for t in range(t_size):
+                        for c in range(c_size):
+                            if self._has_time_axis() and self._has_channel_axis():
+                                # Both time and channel axes - use chunked generator
+                                for slice_data in self._chunked_z_slices(
+                                    t_index=t, c_index=c
+                                ):
+                                    writer.push_slice(slice_data, t_index=t, c_index=c)
+                            elif self._has_time_axis():
+                                # Only time axis - use chunked generator
+                                for slice_data in self._chunked_z_slices(
+                                    t_index=t, c_index=None
+                                ):
+                                    writer.push_slice(slice_data, t_index=t)
+                            elif self._has_channel_axis():
+                                # Only channel axis - use chunked generator
+                                for slice_data in self._chunked_z_slices(
+                                    t_index=None, c_index=c
+                                ):
+                                    writer.push_slice(slice_data, c_index=c)
+                            else:
+                                # Fallback: treat as 3D for each t,c combination
+                                for z in range(z_size):
+                                    # Build indexing tuple dynamically
+                                    indices = []
+                                    for i, dim_size in enumerate(full_res_shape):
+                                        if i == 0:  # time dimension
+                                            indices.append(
+                                                t if t_size > 1 else slice(None)
+                                            )
+                                        elif i == 1 and c_size > 1:  # channel dimension
+                                            indices.append(c)
+                                        elif (
+                                            i == len(full_res_shape) - 3
+                                        ):  # z dimension
+                                            indices.append(z)
+                                        else:
+                                            indices.append(slice(None))
+                                    slice_data = self[tuple(indices)]
+                                    # Ensure we're passing a 2D slice
+                                    if slice_data.ndim == 2:
+                                        writer.push_slice(
+                                            slice_data, t_index=t, c_index=c
+                                        )
+                                    else:
+                                        # If we got a higher-dimensional slice, take the first 2D
+                                        writer.push_slice(
+                                            slice_data.reshape(
+                                                -1, slice_data.shape[-1]
+                                            ),
+                                            t_index=t,
+                                            c_index=c,
+                                        )
+
+            return str(target_path)
+
+        finally:
+            # Reload multiscale metadata
+            self._get_multiscale_metadata()
+            # Restore original resolution level
+            self.resolution_level = original_level
+
+    def __repr__(self) -> str:
+        """Simple representation of OME-Zarr multiscale array."""
+        return (
+            f"OmeZarrArray({self.store_path}) "
+            f"shape={self.shape} "
+            f"dtype={self.dtype} "
+            f"levels={self.ResolutionLevels} "
+            f"current_level={self.resolution_level} "
+            f"ome_v{self._ome_version}"
+        )
+
+    @property
+    def summary(self) -> str:
+        """Brief summary of all resolution levels in repr-style format."""
+
+        current_resolution = self.resolution_level
+        for l in range(self.ResolutionLevels):
+            self.resolution_level = l
+            dataset = self._get_dataset()
+            message = f"Level {l}: shape={dataset.shape}, chunks={dataset.chunks}, dtype={dataset.dtype}"
+            if l == current_resolution:
+                message += " <-- CURRENT LEVEL"
+            print(message)
+        self.resolution_level = current_resolution
+
     def __iter__(self):
         dataset = self._get_dataset()
         if self._timepoint_lock is not None:
@@ -304,3 +610,57 @@ class OmeZarrArray:
             # Normal iteration over first dimension
             for i in range(dataset.shape[0]):
                 yield dataset[i]
+
+    def _chunked_z_slices(
+        self, t_index: Optional[int] = None, c_index: Optional[int] = None
+    ):
+        """
+        Generator that yields z-slices one at a time while reading entire z-chunks.
+
+        This minimizes disk I/O by reading full z-chunks into memory, then
+        yielding individual z-slices from the cached chunk.
+
+        Args:
+            t_index: Fixed time index for 5D data (None for 3D or when not fixed)
+            c_index: Fixed channel index for 5D data (None for 3D or when not fixed)
+
+        Yields:
+            Individual z-slices as numpy arrays
+        """
+        dataset = self._get_dataset()
+
+        # Determine array shape and chunk structure
+        if t_index is not None and c_index is not None:
+            # 5D with both t and c fixed: array[t, c, z, y, x]
+            total_z = dataset.shape[2]  # z is third dimension
+            chunk_size = dataset.chunks[2]  # z-chunk size
+        elif t_index is not None or c_index is not None:
+            # 5D with one dimension fixed: array[dim, z, y, x]
+            total_z = dataset.shape[1]  # z is second dimension
+            chunk_size = dataset.chunks[1]  # z-chunk size
+        else:
+            # 3D case: array[z, y, x]
+            total_z = dataset.shape[0]  # z is first dimension
+            chunk_size = dataset.chunks[0]  # z-chunk size
+
+        # Process chunks one at a time
+        for chunk_start in range(0, total_z, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_z)
+
+            # Build appropriate indexing tuple for chunk read
+            if t_index is not None and c_index is not None:
+                # Read full z-chunk for fixed (t,c)
+                chunk_data = dataset[t_index, c_index, chunk_start:chunk_end]
+            elif t_index is not None:
+                # Read full z-chunk for fixed t
+                chunk_data = dataset[t_index, chunk_start:chunk_end]
+            elif c_index is not None:
+                # Read full z-chunk for fixed c
+                chunk_data = dataset[c_index, chunk_start:chunk_end]
+            else:
+                # Read full z-chunk for 3D case
+                chunk_data = dataset[chunk_start:chunk_end]
+
+            # Yield individual z-slices from the cached chunk (memory access only)
+            for local_z in range(chunk_end - chunk_start):
+                yield chunk_data[local_z]
