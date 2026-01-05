@@ -6,13 +6,22 @@ from ome_zarr_models import open_ome_zarr
 from ome_zarr_models.v05.image import Image as ImageV05
 from ome_zarr_models.v04.image import Image as ImageV04
 from pathlib import Path
+import os
 from .zarr_tools import Live3DPyramidWriter, PyramidSpec, ChunkScheme, FlushPad
+from .helpers import key_to_slices
 
 
 class OmeZarrArray:
     """Convenience class for accessing OME-Zarr v0.4/v0.5 arrays with resolution selection."""
 
+    # Zarr v2 metadata files.
+    ZARR_V2_META = {".zgroup", ".zattrs", ".zarray", ".zmetadata"}
+
+    # Zarr v3 metadata files
+    ZARR_V3_META = {"zarr.json"}
+
     def __init__(self, store_path: str, mode='a') -> None:
+        assert os.path.exists(store_path), f"Zarr store path does not exist: {store_path}"
         self.store_path = store_path
         self.mode = mode
         self.store = zarr.open(store_path, mode=self.mode)
@@ -254,6 +263,9 @@ class OmeZarrArray:
         if not self.resolution_level == 0:
             raise ValueError("""Can only write to resolution level 0 (full resolution data).
             Set OmeZarrArrayObj.resolution_level = 0 before writing.""")
+
+        print(f'{key=}, {self.shape=}')
+        key = key_to_slices(key, self.shape)
 
         dataset = self._get_dataset()
         if self._timepoint_lock is not None:
@@ -695,56 +707,88 @@ class OmeZarrArray:
             for local_z in range(chunk_end - chunk_start):
                 yield chunk_data[local_z]
 
+    def _safe_read_node_type(self, zarr_json_path: Path) -> Optional[str]:
+        """Read zarr.json and return node_type if possible, else None."""
+        try:
+            with open(zarr_json_path, "r") as f:
+                meta = json.load(f)
+            nt = meta.get("node_type")
+            if isinstance(nt, str):
+                return nt
+        except Exception:
+            pass
+        return None
+
     def omezarr_like(self, target_path: Union[str, Path]) -> 'OmeZarrArray':
         """
-        Create an empty OME-Zarr array with the same structure as the current array.
-        
-        Copies metadata but not data, effectively
-        creating an empty zarr array with identical configuration.
-        
-        Args:
-            target_path: Destination path for the new empty array
-            
-        Returns:
-            OmeZarrArray instance pointing to the new empty structure
-            
-        Raises:
-            ValueError: If source zarr store doesn't exist or cannot be copied
-            PermissionError: If cannot write to target location
+        Copy only Zarr metadata (v2 and/or v3) from source to target, while pruning recursion
+        below array nodes to avoid scanning chunk data.
+
+        Pruning rules:
+          - If a directory contains ".zarray" (v2 array node) => copy metadata and STOP recursing.
+          - If a directory contains "zarr.json" whose node_type == "array" (v3 array node) => copy and STOP.
         """
         from pathlib import Path
         import shutil
-        
+
         target_path = Path(target_path)
         source_path = Path(self.store_path)
-        
+
         # Validate source
         if not source_path.exists():
             raise ValueError(f"Source zarr store does not exist: {source_path}")
-        
+
         # Remove target if it exists
         if target_path.exists():
+            print(f'Target {target_path} already exists, removing it first.')
             shutil.rmtree(target_path)
-        
+
         # Create parent directories
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Copy only relevant metadata files and their directory structure
-        for file_path in source_path.rglob('*'):
-            if file_path.is_file():
-                # Only copy zarr metadata files
-                if (file_path.name.endswith('.zarray') or 
-                    file_path.name.endswith('.zattrs') or 
-                    file_path.name.endswith('.zgroup') or 
-                    file_path.name == 'zarr.json'):
-                    
-                    # Calculate relative path and create target directory structure
-                    rel_path = file_path.relative_to(source_path)
-                    target_file_path = target_path / rel_path
-                    target_file_path.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    # Copy the metadata file
-                    shutil.copy2(file_path, target_file_path)
-        
+
+        def copy_file_if_exists(p: Path) -> None:
+            if p.exists() and p.is_file():
+                rel = p.relative_to(source_path)
+                out = target_path / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, out)
+
+        def recurse(dirpath: Path) -> None:
+            # One scandir per directory; don't rglob.
+            try:
+                entries = list(os.scandir(dirpath))
+                # print(f'{entries=} in {dirpath=}')
+            except (FileNotFoundError, NotADirectoryError):
+                return
+
+            # Fast presence checks without extra stat() calls:
+            # We only need names + (dir/file) for recursion.
+            names = {e.name for e in entries}
+
+            # Copy any metadata files present in this directory
+            for meta_name in (self.ZARR_V2_META | self.ZARR_V3_META):
+                # print(f'{meta_name=} in {dirpath=}')
+                if meta_name in names:
+                    # print('Copying', dirpath / meta_name)
+                    copy_file_if_exists(dirpath / meta_name)
+
+            # --- Prune recursion if this is an array node ---
+
+            # Zarr v2 array node
+            if ".zarray" in names:
+                return
+
+            # Zarr v3 array node
+            if "zarr.json" in names:
+                node_type = self._safe_read_node_type(dirpath / "zarr.json")
+                if node_type == "array":
+                    return
+
+            # Otherwise, recurse into subdirectories
+            for e in entries:
+                if e.is_dir(follow_symlinks=False):
+                    recurse(Path(e.path))
+
+        recurse(source_path)
         # Return new OmeZarrArray instance
         return OmeZarrArray(str(target_path))

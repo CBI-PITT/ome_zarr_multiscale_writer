@@ -1,5 +1,9 @@
-import numpy as np
+from __future__ import annotations
 import math
+import numpy as np
+from typing import Tuple, Union
+
+Index = Union[int, slice, type(Ellipsis)]
 
 # ---------- Helpers ----------
 def ceil_div(a, b):  # integer ceil
@@ -66,3 +70,72 @@ def plan_levels(z_estimate, y, x, xy_levels, min_dim=256):
             break
         L += 1
     return L
+
+
+
+def key_to_slices(
+    key: Union[Index, Tuple[Index, ...]],
+    shape: Tuple[int, ...],
+) -> Tuple[slice, ...]:
+    """
+    Convert a __setitem__ key into a tuple of slices, one per dimension.
+
+    Examples
+    --------
+    >>> key_to_slices((0, slice(10, 20), ...), (1, 30, 40))
+    (slice(0, 1), slice(10, 20), slice(0, 40))
+
+    >>> key_to_slices(5, (100,))
+    (slice(5, 6),)
+
+    >>> key_to_slices((slice(None), 3), (10, 20))
+    (slice(0, 10), slice(3, 4))
+    """
+
+    if not isinstance(key, tuple):
+        key = (key,)
+
+    ndim = len(shape)
+
+    # Expand ellipsis
+    if Ellipsis in key:
+        if key.count(Ellipsis) > 1:
+            raise IndexError("Only one ellipsis allowed")
+
+        i = key.index(Ellipsis)
+        num_missing = ndim - (len(key) - 1)
+        if num_missing < 0:
+            raise IndexError("Too many indices")
+
+        key = (
+            key[:i]
+            + (slice(None),) * num_missing
+            + key[i + 1 :]
+        )
+
+    # Pad with full slices if needed
+    if len(key) < ndim:
+        key = key + (slice(None),) * (ndim - len(key))
+    elif len(key) > ndim:
+        raise IndexError("Too many indices")
+
+    out = []
+
+    for k, dim in zip(key, shape):
+        if isinstance(k, slice):
+            start, stop, step = k.indices(dim)
+            if step != 1:
+                raise ValueError("Step slicing is not supported")
+            out.append(slice(start, stop))
+
+        elif isinstance(k, (int, np.integer)):
+            if k < 0:
+                k += dim
+            if not (0 <= k < dim):
+                raise IndexError("Index out of bounds")
+            out.append(slice(k, k + 1))
+
+        else:
+            raise TypeError(f"Unsupported index type: {type(k)}")
+
+    return tuple(out)

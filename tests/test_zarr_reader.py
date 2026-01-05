@@ -528,3 +528,6 @@ if __name__ == "__main__":
     # Example usage
     mesospim_ome_zarr_path = r"c:\code\Mag2_Tile0_Ch488_Sh1_Rot0.ome.zarr"  # Replace with your OME-Zarr path
     mesospim_ome_array = OmeZarrArray(mesospim_ome_zarr_path)
+
+    acquire_path = r"Z:\Acquire\MesoSPIM\alan-test\spinal cord 16x\spinal_cord_16x_Mag16x_Ch561.ome.zarr\s21-t0.zarr"
+    acquire = OmeZarrArray(acquire_path)
