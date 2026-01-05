@@ -243,6 +243,35 @@ class OmeZarrArray:
                     key = key[:time_idx] + (self._timepoint_lock,) + key[time_idx + 1 :]
         return dataset[key]
 
+    def __setitem__(
+        self, key: Union[int, slice, Tuple, np.ndarray, TypingAny], value: Union[np.ndarray, TypingAny]
+    ) -> Union[np.ndarray, TypingAny]:
+
+        if not self.mode in ['a', 'r+']:
+            raise ValueError("""Array is not opened in write mode. Must be 'a'.
+            Example: OmeZarrArray(store_path, mode='a').
+            OmeZarrArrayObj.mode = 'a'""")
+        if not self.resolution_level == 0:
+            raise ValueError("""Can only write to resolution level 0 (full resolution data).
+            Set OmeZarrArrayObj.resolution_level = 0 before writing.""")
+
+        dataset = self._get_dataset()
+        if self._timepoint_lock is not None:
+            time_idx = self._get_axis_index("time")
+            if time_idx is not None:
+                # Insert timepoint lock at the correct position
+                if isinstance(key, tuple):
+                    # If key is already a tuple, insert the timepoint at the right position
+                    key = key[:time_idx] + (self._timepoint_lock,) + key[time_idx:]
+                else:
+                    # If key is a single slice/index, create a tuple with timepoint
+                    key = tuple(
+                        slice(None) if i == time_idx else key
+                        for i in range(dataset.ndim)
+                    )
+                    key = key[:time_idx] + (self._timepoint_lock,) + key[time_idx + 1 :]
+        dataset[key] = value
+
     def print_chunk_info(self) -> None:
         """Print number of initialized chunks out of total chunks for current resolution level."""
         dataset = self._get_dataset()
@@ -670,7 +699,7 @@ class OmeZarrArray:
         """
         Create an empty OME-Zarr array with the same structure as the current array.
         
-        Copies the entire directory structure and metadata but removes all data,
+        Copies metadata but not data, effectively
         creating an empty zarr array with identical configuration.
         
         Args:
