@@ -12,9 +12,10 @@ from .zarr_tools import Live3DPyramidWriter, PyramidSpec, ChunkScheme, FlushPad
 class OmeZarrArray:
     """Convenience class for accessing OME-Zarr v0.4/v0.5 arrays with resolution selection."""
 
-    def __init__(self, store_path: str) -> None:
+    def __init__(self, store_path: str, mode='a') -> None:
         self.store_path = store_path
-        self.store = zarr.open(store_path, mode="a")
+        self.mode = mode
+        self.store = zarr.open(store_path, mode=self.mode)
         self._get_multiscale_metadata()
         self._resolution_level: int = 0
         self._timepoint_lock: int | None = None
@@ -661,6 +662,60 @@ class OmeZarrArray:
                 # Read full z-chunk for 3D case
                 chunk_data = dataset[chunk_start:chunk_end]
 
-            # Yield individual z-slices from the cached chunk (memory access only)
+# Yield individual z-slices from the cached chunk (memory access only)
             for local_z in range(chunk_end - chunk_start):
                 yield chunk_data[local_z]
+
+    def omezarr_like(self, target_path: Union[str, Path]) -> 'OmeZarrArray':
+        """
+        Create an empty OME-Zarr array with the same structure as the current array.
+        
+        Copies the entire directory structure and metadata but removes all data,
+        creating an empty zarr array with identical configuration.
+        
+        Args:
+            target_path: Destination path for the new empty array
+            
+        Returns:
+            OmeZarrArray instance pointing to the new empty structure
+            
+        Raises:
+            ValueError: If source zarr store doesn't exist or cannot be copied
+            PermissionError: If cannot write to target location
+        """
+        from pathlib import Path
+        import shutil
+        
+        target_path = Path(target_path)
+        source_path = Path(self.store_path)
+        
+        # Validate source
+        if not source_path.exists():
+            raise ValueError(f"Source zarr store does not exist: {source_path}")
+        
+        # Remove target if it exists
+        if target_path.exists():
+            shutil.rmtree(target_path)
+        
+        # Create parent directories
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Copy only relevant metadata files and their directory structure
+        for file_path in source_path.rglob('*'):
+            if file_path.is_file():
+                # Only copy zarr metadata files
+                if (file_path.name.endswith('.zarray') or 
+                    file_path.name.endswith('.zattrs') or 
+                    file_path.name.endswith('.zgroup') or 
+                    file_path.name == 'zarr.json'):
+                    
+                    # Calculate relative path and create target directory structure
+                    rel_path = file_path.relative_to(source_path)
+                    target_file_path = target_path / rel_path
+                    target_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Copy the metadata file
+                    shutil.copy2(file_path, target_file_path)
+        
+        # Return new OmeZarrArray instance
+        return OmeZarrArray(str(target_path))
