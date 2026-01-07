@@ -2,6 +2,7 @@ import zarr
 import numpy as np
 from typing import List, Dict, Any, cast, Union, Tuple, Any as TypingAny, Optional
 from zarr import Array
+import dask.array as da
 from ome_zarr_models import open_ome_zarr
 from ome_zarr_models.v05.image import Image as ImageV05
 from ome_zarr_models.v04.image import Image as ImageV04
@@ -20,11 +21,11 @@ class OmeZarrArray:
     # Zarr v3 metadata files
     ZARR_V3_META = {"zarr.json"}
 
-    def __init__(self, store_path: str, mode='a') -> None:
+    def __init__(self, store_path: str, mode='r') -> None:
         assert os.path.exists(store_path), f"Zarr store path does not exist: {store_path}"
         self.store_path = store_path
-        self.mode = mode
-        self.store = zarr.open(store_path, mode=self.mode)
+        self._mode = mode
+        self.store = zarr.open(store_path, mode=self._mode)
         self._get_multiscale_metadata()
         self._resolution_level: int = 0
         self._timepoint_lock: int | None = None
@@ -87,6 +88,21 @@ class OmeZarrArray:
     @property
     def resolution_level(self) -> int:
         return self._resolution_level
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
+    def nbytes(self) -> int:
+        return self._get_dataset().nbytes
+
+    @mode.setter
+    def mode(self, mode) -> None:
+        if mode.lower() == self._mode:
+            return  # No change
+        self._mode = mode.lower()
+        self.store = zarr.open(self.store_path, mode=self._mode)
 
     @resolution_level.setter
     def resolution_level(self, level: int) -> None:
@@ -365,6 +381,7 @@ class OmeZarrArray:
         compressor: Optional[str] = None,
         compression_level: int = 5,
         flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
+        async_close = True,
         **kwargs,
     ) -> str:
         """
@@ -535,6 +552,7 @@ class OmeZarrArray:
                 flush_pad=flush_pad,
                 ome_version=self._ome_version,
                 write_level0=write_level0,
+                async_close=async_close,
                 **kwargs,
             )
 
@@ -792,3 +810,32 @@ class OmeZarrArray:
         recurse(source_path)
         # Return new OmeZarrArray instance
         return OmeZarrArray(str(target_path))
+
+    def to_dask(
+            self,
+            *,
+            chunks: tuple | str | None = None,
+            name: str | None = None,
+            lock: bool = False,
+            inline_array: bool = True,
+    ) -> da.Array:
+        """
+        Return a dask.array backed by the current resolution level (and respecting timepoint_lock).
+
+        - chunks=None  -> keep Zarr's on-disk chunking (recommended)
+        - chunks="auto" or a tuple -> rechunk in Dask (may increase overhead)
+        """
+        z = self._get_dataset()
+
+        # Build the dask array from the zarr array
+        x = da.from_zarr(z, chunks=chunks, name=name, inline_array=inline_array, lock=lock)
+
+        # If timepoint is locked, slice out that time index in Dask too (so shape matches self.shape)
+        if self._timepoint_lock is not None:
+            t_idx = self._get_axis_index("time")
+            if t_idx is not None:
+                sl = [slice(None)] * x.ndim
+                sl[t_idx] = self._timepoint_lock
+                x = x[tuple(sl)]
+
+        return x
