@@ -8,8 +8,147 @@ from ome_zarr_models.v05.image import Image as ImageV05
 from ome_zarr_models.v04.image import Image as ImageV04
 from pathlib import Path
 import os
+import json
 from .zarr_tools import Live3DPyramidWriter, PyramidSpec, ChunkScheme, FlushPad
 from .helpers import key_to_slices
+
+
+class ZarrToOmeZarrConverter:
+    """
+    Converter class for transforming generic Zarr v2/v3 arrays into OME-Zarr format.
+
+    This class opens a Zarr store containing a generic array (not necessarily OME-Zarr)
+    and provides methods to add OME-Zarr metadata, converting it to a valid OME-Zarr
+    store with a single multiscale level (level 0). It does not create additional
+    multiscale levels or copy data; it only adds metadata.
+
+    Assumes the array to convert is located at the specified array_path (default "0").
+    """
+
+    def __init__(self, store_path: str, array_path: str = "0", mode: str = "r"):
+        """
+        Initialize the converter.
+
+        Args:
+            store_path: Path to the Zarr store.
+            array_path: Path to the array within the store (default "0").
+            mode: Access mode ('r', 'r+', 'a', etc.).
+        """
+        self.store_path = store_path
+        self.array_path = array_path
+        self.mode = mode
+        self.store = zarr.open(store_path, mode=mode)
+        self.array = self.store[array_path]
+        if not isinstance(self.array, zarr.Array):
+            raise ValueError(
+                f"Expected zarr.Array at {array_path}, got {type(self.array)}"
+            )
+
+    def convert(
+        self,
+        axes: Optional[List[Dict[str, Any]]] = None,
+        voxel_size: Optional[Tuple[float, ...]] = None,
+        ome_version: str = "0.5",
+    ) -> None:
+        """
+        Convert the Zarr array to OME-Zarr format by adding multiscale metadata.
+
+        Modifies the store in place by adding OME-Zarr metadata for a single level (level 0).
+
+        Args:
+            axes: List of axis dictionaries. If None, inferred from array dimensionality.
+            voxel_size: Voxel size for spatial axes (z, y, x). If None, defaults to 1.0.
+            ome_version: OME-Zarr version ('0.4' or '0.5', default '0.5').
+        """
+        if ome_version not in ["0.4", "0.5"]:
+            raise ValueError("ome_version must be '0.4' or '0.5'")
+
+        ndim = self.array.ndim
+        if axes is None:
+            axes = self._infer_axes(ndim)
+
+        spatial_dims = sum(1 for axis in axes if axis.get("type") == "space")
+        if voxel_size is None:
+            voxel_size = tuple(1.0 for _ in range(spatial_dims))
+        if len(voxel_size) != spatial_dims:
+            raise ValueError(
+                f"voxel_size length {len(voxel_size)} does not match spatial dimensions {spatial_dims}"
+            )
+
+        # Build scale and translation transformations
+        scale = [1.0] * len(axes)
+        translation = [0.0] * len(axes)
+        spatial_idx = 0
+        for i, axis in enumerate(axes):
+            if axis.get("type") == "space" and spatial_idx < len(voxel_size):
+                scale[i] = voxel_size[spatial_idx]
+                spatial_idx += 1
+
+        datasets = [
+            {
+                "path": self.array_path,
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": scale},
+                    {"type": "translation", "translation": translation},
+                ],
+            }
+        ]
+
+        multiscales = [
+            {
+                "version": ome_version,
+                "axes": axes,
+                "datasets": datasets,
+                "name": "image",
+            }
+        ]
+
+        if ome_version == "0.5":
+            multiscales[0]["type"] = "image"
+
+        # Add metadata to store attributes
+        if ome_version == "0.4":
+            self.store.attrs["multiscales"] = multiscales
+        else:
+            if "ome" not in self.store.attrs:
+                self.store.attrs["ome"] = {}
+            self.store.attrs["ome"]["version"] = ome_version
+            self.store.attrs["ome"]["multiscales"] = multiscales
+
+    def _infer_axes(self, ndim: int) -> List[Dict[str, Any]]:
+        """Infer axes metadata from array dimensionality."""
+        if ndim == 5:
+            return [
+                {"name": "t", "type": "time"},
+                {"name": "c", "type": "channel"},
+                {"name": "z", "type": "space", "unit": "micrometer"},
+                {"name": "y", "type": "space", "unit": "micrometer"},
+                {"name": "x", "type": "space", "unit": "micrometer"},
+            ]
+        elif ndim == 4:
+            # Assume channel, z, y, x
+            return [
+                {"name": "c", "type": "channel"},
+                {"name": "z", "type": "space", "unit": "micrometer"},
+                {"name": "y", "type": "space", "unit": "micrometer"},
+                {"name": "x", "type": "space", "unit": "micrometer"},
+            ]
+        elif ndim == 3:
+            return [
+                {"name": "z", "type": "space", "unit": "micrometer"},
+                {"name": "y", "type": "space", "unit": "micrometer"},
+                {"name": "x", "type": "space", "unit": "micrometer"},
+            ]
+        elif ndim == 2:
+            return [
+                {"name": "y", "type": "space", "unit": "micrometer"},
+                {"name": "x", "type": "space", "unit": "micrometer"},
+            ]
+        else:
+            return [
+                {"name": f"axis_{i}", "type": "space" if i >= ndim - 3 else "unknown"}
+                for i in range(ndim)
+            ]
 
 
 class OmeZarrArray:
@@ -21,8 +160,10 @@ class OmeZarrArray:
     # Zarr v3 metadata files
     ZARR_V3_META = {"zarr.json"}
 
-    def __init__(self, store_path: str, mode='r') -> None:
-        assert os.path.exists(store_path), f"Zarr store path does not exist: {store_path}"
+    def __init__(self, store_path: str, mode="r") -> None:
+        assert os.path.exists(store_path), (
+            f"Zarr store path does not exist: {store_path}"
+        )
         self.store_path = store_path
         self._mode = mode
         self.store = zarr.open(store_path, mode=self._mode)
@@ -269,10 +410,11 @@ class OmeZarrArray:
         return dataset[key]
 
     def __setitem__(
-        self, key: Union[int, slice, Tuple, np.ndarray, TypingAny], value: Union[np.ndarray, TypingAny]
+        self,
+        key: Union[int, slice, Tuple, np.ndarray, TypingAny],
+        value: Union[np.ndarray, TypingAny],
     ) -> Union[np.ndarray, TypingAny]:
-
-        if not self.mode in ['a', 'r+']:
+        if not self.mode in ["a", "r+"]:
             raise ValueError("""Array is not opened in write mode. Must be 'a'.
             Example: OmeZarrArray(store_path, mode='a').
             OmeZarrArrayObj.mode = 'a'""")
@@ -280,7 +422,7 @@ class OmeZarrArray:
             raise ValueError("""Can only write to resolution level 0 (full resolution data).
             Set OmeZarrArrayObj.resolution_level = 0 before writing.""")
 
-        print(f'{key=}, {self.shape=}')
+        print(f"{key=}, {self.shape=}")
         key = key_to_slices(key, self.shape)
 
         dataset = self._get_dataset()
@@ -381,7 +523,7 @@ class OmeZarrArray:
         compressor: Optional[str] = None,
         compression_level: int = 5,
         flush_pad: FlushPad = FlushPad.DUPLICATE_LAST,
-        async_close = True,
+        async_close=True,
         **kwargs,
     ) -> str:
         """
@@ -721,7 +863,7 @@ class OmeZarrArray:
                 # Read full z-chunk for 3D case
                 chunk_data = dataset[chunk_start:chunk_end]
 
-# Yield individual z-slices from the cached chunk (memory access only)
+            # Yield individual z-slices from the cached chunk (memory access only)
             for local_z in range(chunk_end - chunk_start):
                 yield chunk_data[local_z]
 
@@ -737,7 +879,7 @@ class OmeZarrArray:
             pass
         return None
 
-    def omezarr_like(self, target_path: Union[str, Path]) -> 'OmeZarrArray':
+    def omezarr_like(self, target_path: Union[str, Path]) -> "OmeZarrArray":
         """
         Copy only Zarr metadata (v2 and/or v3) from source to target, while pruning recursion
         below array nodes to avoid scanning chunk data.
@@ -758,7 +900,7 @@ class OmeZarrArray:
 
         # Remove target if it exists
         if target_path.exists():
-            print(f'Target {target_path} already exists, removing it first.')
+            print(f"Target {target_path} already exists, removing it first.")
             shutil.rmtree(target_path)
 
         # Create parent directories
@@ -784,7 +926,7 @@ class OmeZarrArray:
             names = {e.name for e in entries}
 
             # Copy any metadata files present in this directory
-            for meta_name in (self.ZARR_V2_META | self.ZARR_V3_META):
+            for meta_name in self.ZARR_V2_META | self.ZARR_V3_META:
                 # print(f'{meta_name=} in {dirpath=}')
                 if meta_name in names:
                     # print('Copying', dirpath / meta_name)
@@ -812,12 +954,12 @@ class OmeZarrArray:
         return OmeZarrArray(str(target_path))
 
     def to_dask(
-            self,
-            *,
-            chunks: tuple | str | None = None,
-            name: str | None = None,
-            lock: bool = False,
-            inline_array: bool = True,
+        self,
+        *,
+        chunks: tuple | str | None = None,
+        name: str | None = None,
+        lock: bool = False,
+        inline_array: bool = True,
     ) -> da.Array:
         """
         Return a dask.array backed by the current resolution level (and respecting timepoint_lock).
@@ -828,7 +970,9 @@ class OmeZarrArray:
         z = self._get_dataset()
 
         # Build the dask array from the zarr array
-        x = da.from_zarr(z, chunks=chunks, name=name, inline_array=inline_array, lock=lock)
+        x = da.from_zarr(
+            z, chunks=chunks, name=name, inline_array=inline_array, lock=lock
+        )
 
         # If timepoint is locked, slice out that time index in Dask too (so shape matches self.shape)
         if self._timepoint_lock is not None:
