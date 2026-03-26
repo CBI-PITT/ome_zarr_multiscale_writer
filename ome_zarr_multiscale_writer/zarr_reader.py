@@ -161,12 +161,13 @@ class OmeZarrArray:
     # Zarr v3 metadata files
     ZARR_V3_META = {"zarr.json"}
 
-    def __init__(self, store_path: str, mode="r") -> None:
+    def __init__(self, store_path: str, mode="r", verbose: bool = True) -> None:
         assert os.path.exists(store_path), (
             f"Zarr store path does not exist: {store_path}"
         )
         self.store_path = store_path
         self._mode = mode
+        self.verbose = verbose
         self.store = zarr.open(store_path, mode=self._mode)
         self._get_multiscale_metadata()
         self._resolution_level: int = 0
@@ -1203,6 +1204,7 @@ class OmeZarrArray:
                 files_written += len(open_memmaps)
                 open_memmaps.clear()
 
+            current_chunk = 1
             for _chunk_idx, slices, data in self.iter_chunks():
                 z_sl: slice = slices[z_dim]
                 z_range = (z_sl.start, z_sl.stop)
@@ -1223,12 +1225,14 @@ class OmeZarrArray:
                 x_sl: slice = slices[x_dim]
 
                 for global_c in range(c_start, c_stop):
+                    if self.verbose: print(f"Writing chunks {current_chunk}/{self.total_chunks}")
                     for global_z in range(z_range[0], z_range[1]):
                         key = (global_c, global_z)
 
                         # Lazily create the memmap TIFF on first touch.
                         if key not in open_memmaps:
                             fpath = str(output_dir / _make_fname(*key))
+                            if self.verbose: print(f"Creating tiff memmap for {fpath}")
                             open_memmaps[key] = tifffile.memmap(
                                 fpath,
                                 shape=(full_y, full_x),
@@ -1249,6 +1253,7 @@ class OmeZarrArray:
                             y_sl.start : y_sl.stop,
                             x_sl.start : x_sl.stop,
                         ] = tile
+                current_chunk += 1
 
             # Flush any remaining memmaps after the last chunk.
             _flush_memmaps()
