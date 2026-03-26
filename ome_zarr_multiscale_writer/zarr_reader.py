@@ -1,6 +1,7 @@
 import zarr
 import numpy as np
-from typing import List, Dict, Any, cast, Union, Tuple, Any as TypingAny, Optional
+import tifffile
+from typing import Generator, List, Dict, Any, cast, Union, Tuple, Any as TypingAny, Optional
 from zarr import Array
 import dask.array as da
 from ome_zarr_models import open_ome_zarr
@@ -813,6 +814,82 @@ class OmeZarrArray:
             for i in range(dataset.shape[0]):
                 yield dataset[i]
 
+    def iter_chunks(self) -> Generator[Tuple[Tuple[int, ...], Tuple[slice, ...], np.ndarray], None, None]:
+        """
+        Generator that yields one chunk at a time from the current resolution level.
+
+        Iterates over the full chunk grid of the array (respecting timepoint_lock)
+        and yields each chunk as a tuple of ``(chunk_index, slices, data)``:
+
+        - **chunk_index**: tuple of ints – the N-dimensional chunk coordinate,
+          e.g. ``(0, 1, 2)`` for a 3-D array.
+        - **slices**: tuple of :class:`slice` objects – the array-space region
+          that this chunk covers.  Can be fed straight back into ``__setitem__``.
+        - **data**: :class:`numpy.ndarray` – the chunk's voxel data.
+
+        Yields:
+            Tuple[Tuple[int, ...], Tuple[slice, ...], np.ndarray]
+        """
+        dataset = self._get_dataset()
+        shape = dataset.shape
+        chunks = dataset.chunks
+
+        # When timepoint is locked, we read from the underlying dataset
+        # but present the data without the time dimension.
+        time_idx = None
+        locked_t = None
+        if self._timepoint_lock is not None:
+            time_idx = self._get_axis_index("time")
+            locked_t = self._timepoint_lock
+
+        # Build the effective shape/chunks (what the caller sees).
+        if time_idx is not None:
+            eff_shape = shape[:time_idx] + shape[time_idx + 1 :]
+            eff_chunks = chunks[:time_idx] + chunks[time_idx + 1 :]
+        else:
+            eff_shape = shape
+            eff_chunks = chunks
+
+        ndim = len(eff_shape)
+
+        # Compute the number of chunks along each effective dimension.
+        n_chunks_per_dim = tuple(
+            int(np.ceil(s / c)) for s, c in zip(eff_shape, eff_chunks)
+        )
+
+        # Total number of chunks (for progress tracking if needed)
+        total = int(np.prod(n_chunks_per_dim))
+        if total == 0:
+            return
+
+        # Iterate over every chunk coordinate in row-major (C) order.
+        for flat_idx in range(total):
+            # Convert flat index to N-dimensional chunk coordinate.
+            chunk_idx = []
+            remainder = flat_idx
+            for dim in range(ndim):
+                stride = int(np.prod(n_chunks_per_dim[dim + 1 :])) if dim + 1 < ndim else 1
+                chunk_idx.append(remainder // stride)
+                remainder %= stride
+            chunk_idx = tuple(chunk_idx)
+
+            # Build the slice for each effective dimension.
+            eff_slices = tuple(
+                slice(ci * cs, min((ci + 1) * cs, s))
+                for ci, cs, s in zip(chunk_idx, eff_chunks, eff_shape)
+            )
+
+            # Build the indexing key for the underlying dataset (re-inserting
+            # the locked timepoint if necessary).
+            if time_idx is not None:
+                ds_key = eff_slices[:time_idx] + (locked_t,) + eff_slices[time_idx:]
+            else:
+                ds_key = eff_slices
+
+            data = dataset[ds_key]
+
+            yield chunk_idx, eff_slices, data
+
     def _chunked_z_slices(
         self, t_index: Optional[int] = None, c_index: Optional[int] = None
     ):
@@ -983,3 +1060,152 @@ class OmeZarrArray:
                 x = x[tuple(sl)]
 
         return x
+
+    def to_tiff_stack(
+        self,
+        output_dir: Union[str, Path],
+        basename: Optional[str] = None,
+    ) -> str:
+        """
+        Export the current resolution level as individual 2D TIFF files,
+        one per channel per z-layer, reading only one chunk at a time.
+
+        Files are written to *output_dir* with the naming pattern::
+
+            {basename}_c{C}_z{Z}.tiff
+
+        where *C* is the zero-based channel index and *Z* is the zero-padded
+        z-layer index.
+
+        The method streams data through :meth:`iter_chunks`, so only a single
+        chunk is held in memory at any moment regardless of array size.
+
+        Args:
+            output_dir: Directory where TIFF files will be written.  Created
+                automatically (including parents) if it does not exist.
+            basename: Stem used in every filename.  Defaults to the store
+                directory name (e.g. ``"my_store"`` for ``my_store.zarr``).
+
+        Returns:
+            The absolute path to *output_dir*.
+
+        Raises:
+            ValueError: If the effective array dimensionality after applying
+                ``timepoint_lock`` is not 3-D ``(z, y, x)`` or 4-D
+                ``(c, z, y, x)``.
+
+        Notes:
+            * If the array has a time axis and ``timepoint_lock`` is not set,
+              timepoint 0 is exported and a warning is printed.
+            * Works at the current ``resolution_level``.
+            * The ``slices`` tuple yielded by :meth:`iter_chunks` is used to
+              compute global z/channel indices, so chunk boundaries that span
+              multiple z-layers are handled correctly.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if basename is None:
+            basename = Path(self.store_path).stem
+
+        # ---- Handle time axis ------------------------------------------------
+        restore_timepoint = False
+        if self._has_time_axis() and self._timepoint_lock is None:
+            print(
+                "Warning: array has a time axis but no timepoint_lock is set. "
+                "Defaulting to timepoint 0."
+            )
+            self.timepoint_lock = 0
+            restore_timepoint = True
+
+        try:
+            # After timepoint_lock is applied, the effective shape seen by
+            # iter_chunks has the time dimension removed.  Determine axis
+            # layout from the *effective* axis names.
+            eff_axis_names = list(self.axis_names)
+            if self._timepoint_lock is not None:
+                t_idx = self._get_axis_index("time")
+                if t_idx is not None and t_idx < len(eff_axis_names):
+                    eff_axis_names = (
+                        eff_axis_names[:t_idx] + eff_axis_names[t_idx + 1 :]
+                    )
+
+            eff_shape = self.shape  # already has time removed when locked
+
+            # Identify dimension positions in the effective layout.
+            try:
+                z_dim = eff_axis_names.index("z")
+                y_dim = eff_axis_names.index("y")
+                x_dim = eff_axis_names.index("x")
+            except ValueError as exc:
+                raise ValueError(
+                    f"Cannot locate z/y/x axes in effective axis names "
+                    f"{eff_axis_names}. Ensure the array has spatial axes."
+                ) from exc
+
+            c_dim: Optional[int] = None
+            n_channels = 1
+            if "c" in eff_axis_names:
+                c_dim = eff_axis_names.index("c")
+                n_channels = eff_shape[c_dim]
+
+            total_z = eff_shape[z_dim]
+
+            # Zero-pad width so filenames sort lexicographically.
+            z_pad = max(len(str(total_z - 1)), 1)
+            c_pad = max(len(str(n_channels - 1)), 1)
+
+            # ---- Stream chunks and decompose into 2D planes ------------------
+            files_written = 0
+            for _chunk_idx, slices, data in self.iter_chunks():
+                # Determine global index ranges covered by this chunk for z and c.
+                z_slice: slice = slices[z_dim]
+                z_start = z_slice.start
+                z_stop = z_slice.stop
+
+                if c_dim is not None:
+                    c_slice: slice = slices[c_dim]
+                    c_start = c_slice.start
+                    c_stop = c_slice.stop
+                else:
+                    c_start = 0
+                    c_stop = 1
+
+                # Iterate over each channel and z-layer within this chunk.
+                for global_c in range(c_start, c_stop):
+                    for global_z in range(z_start, z_stop):
+                        # Build an indexing tuple into *data* (chunk-local).
+                        local_idx = [slice(None)] * data.ndim
+                        local_idx[z_dim] = global_z - z_start
+                        if c_dim is not None:
+                            local_idx[c_dim] = global_c - c_start
+                        plane = data[tuple(local_idx)]
+
+                        # plane should now be 2-D (y, x).  Squeeze any
+                        # remaining size-1 dimensions defensively.
+                        if plane.ndim > 2:
+                            plane = plane.squeeze()
+                        if plane.ndim != 2:
+                            raise ValueError(
+                                f"Expected 2-D plane but got shape {plane.shape} "
+                                f"at c={global_c}, z={global_z}."
+                            )
+
+                        fname = (
+                            f"{basename}"
+                            f"_c{str(global_c).zfill(c_pad)}"
+                            f"_z{str(global_z).zfill(z_pad)}"
+                            f".tiff"
+                        )
+                        tifffile.imwrite(str(output_dir / fname), plane)
+                        files_written += 1
+
+            print(
+                f"Wrote {files_written} TIFF files to {output_dir} "
+                f"({n_channels} channel(s), {total_z} z-layer(s))."
+            )
+            return str(output_dir.resolve())
+
+        finally:
+            if restore_timepoint:
+                self._timepoint_lock = None
