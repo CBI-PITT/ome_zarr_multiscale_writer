@@ -1155,50 +1155,92 @@ class OmeZarrArray:
             z_pad = max(len(str(total_z - 1)), 1)
             c_pad = max(len(str(n_channels - 1)), 1)
 
-            # ---- Stream chunks and decompose into 2D planes ------------------
+            # ---- Stream chunks and paint tiles into memory-mapped TIFFs ----
+            #
+            # Each TIFF is one full (Y, X) plane created via tifffile.memmap.
+            # The OS page cache manages which 4 KB pages are resident, so
+            # Python heap usage stays at roughly one zarr chunk at a time.
+            #
+            # Memmaps are kept open for the current z-chunk-range.  When
+            # iter_chunks moves to a new z-range (C-order guarantees all YX
+            # tiles for a z-range arrive before the next), we flush and
+            # close the previous batch.
+
+            full_y = eff_shape[y_dim]
+            full_x = eff_shape[x_dim]
+            data_dtype = self.dtype
+
+            # {(global_c, global_z): np.memmap} for the active z-chunk-range
+            open_memmaps: Dict[Tuple[int, int], np.memmap] = {}
+            current_z_range: Optional[Tuple[int, int]] = None
             files_written = 0
+
+            def _make_fname(gc: int, gz: int) -> str:
+                return (
+                    f"{basename}"
+                    f"_c{str(gc).zfill(c_pad)}"
+                    f"_z{str(gz).zfill(z_pad)}"
+                    f".tiff"
+                )
+
+            def _flush_memmaps() -> None:
+                """Flush and close all active memmaps."""
+                nonlocal files_written
+                for mm in open_memmaps.values():
+                    mm.flush()
+                    del mm
+                files_written += len(open_memmaps)
+                open_memmaps.clear()
+
             for _chunk_idx, slices, data in self.iter_chunks():
-                # Determine global index ranges covered by this chunk for z and c.
-                z_slice: slice = slices[z_dim]
-                z_start = z_slice.start
-                z_stop = z_slice.stop
+                z_sl: slice = slices[z_dim]
+                z_range = (z_sl.start, z_sl.stop)
+
+                # When the z-range changes, all YX tiles for the previous
+                # range are complete — flush them to disk.
+                if current_z_range is not None and z_range != current_z_range:
+                    _flush_memmaps()
+                current_z_range = z_range
 
                 if c_dim is not None:
-                    c_slice: slice = slices[c_dim]
-                    c_start = c_slice.start
-                    c_stop = c_slice.stop
+                    c_sl: slice = slices[c_dim]
+                    c_start, c_stop = c_sl.start, c_sl.stop
                 else:
-                    c_start = 0
-                    c_stop = 1
+                    c_start, c_stop = 0, 1
 
-                # Iterate over each channel and z-layer within this chunk.
+                y_sl: slice = slices[y_dim]
+                x_sl: slice = slices[x_dim]
+
                 for global_c in range(c_start, c_stop):
-                    for global_z in range(z_start, z_stop):
-                        # Build an indexing tuple into *data* (chunk-local).
-                        local_idx = [slice(None)] * data.ndim
-                        local_idx[z_dim] = global_z - z_start
-                        if c_dim is not None:
-                            local_idx[c_dim] = global_c - c_start
-                        plane = data[tuple(local_idx)]
+                    for global_z in range(z_range[0], z_range[1]):
+                        key = (global_c, global_z)
 
-                        # plane should now be 2-D (y, x).  Squeeze any
-                        # remaining size-1 dimensions defensively.
-                        if plane.ndim > 2:
-                            plane = plane.squeeze()
-                        if plane.ndim != 2:
-                            raise ValueError(
-                                f"Expected 2-D plane but got shape {plane.shape} "
-                                f"at c={global_c}, z={global_z}."
+                        # Lazily create the memmap TIFF on first touch.
+                        if key not in open_memmaps:
+                            fpath = str(output_dir / _make_fname(*key))
+                            open_memmaps[key] = tifffile.memmap(
+                                fpath,
+                                shape=(full_y, full_x),
+                                dtype=data_dtype,
                             )
 
-                        fname = (
-                            f"{basename}"
-                            f"_c{str(global_c).zfill(c_pad)}"
-                            f"_z{str(global_z).zfill(z_pad)}"
-                            f".tiff"
-                        )
-                        tifffile.imwrite(str(output_dir / fname), plane)
-                        files_written += 1
+                        # Extract the 2-D tile from chunk data.
+                        local_idx: list = [slice(None)] * data.ndim
+                        local_idx[z_dim] = global_z - z_range[0]
+                        if c_dim is not None:
+                            local_idx[c_dim] = global_c - c_start
+                        tile = data[tuple(local_idx)]
+                        if tile.ndim > 2:
+                            tile = tile.squeeze()
+
+                        # Paint the tile into the correct YX region.
+                        open_memmaps[key][
+                            y_sl.start : y_sl.stop,
+                            x_sl.start : x_sl.stop,
+                        ] = tile
+
+            # Flush any remaining memmaps after the last chunk.
+            _flush_memmaps()
 
             print(
                 f"Wrote {files_written} TIFF files to {output_dir} "
