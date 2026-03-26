@@ -1101,6 +1101,17 @@ class OmeZarrArray:
             * The ``slices`` tuple yielded by :meth:`iter_chunks` is used to
               compute global z/channel indices, so chunk boundaries that span
               multiple z-layers are handled correctly.
+            * Output TIFFs are **uncompressed** (required by ``tifffile.memmap``).
+
+        .. todo:: Compressed TIFF support
+            Add optional ``compression`` and ``compression_level`` parameters.
+            Approach: use raw ``np.memmap`` scratch files (OS-paged, not heap)
+            to accumulate tiles, then flush each completed plane through
+            ``tifffile.imwrite(compression=...)`` which reads in strips (~1.5 MB
+            each).  Peak Python heap stays at one zarr chunk; temporary disk
+            cost is one z-chunk-range of scratch files (~2 GB for typical data).
+            When ``compression is None``, keep the current direct-memmap path
+            for zero overhead.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
