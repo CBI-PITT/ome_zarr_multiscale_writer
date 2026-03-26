@@ -1,6 +1,7 @@
 import zarr
 import numpy as np
-from typing import List, Dict, Any, cast, Union, Tuple, Any as TypingAny, Optional
+import tifffile
+from typing import Generator, List, Dict, Any, cast, Union, Tuple, Any as TypingAny, Optional
 from zarr import Array
 import dask.array as da
 from ome_zarr_models import open_ome_zarr
@@ -160,12 +161,13 @@ class OmeZarrArray:
     # Zarr v3 metadata files
     ZARR_V3_META = {"zarr.json"}
 
-    def __init__(self, store_path: str, mode="r") -> None:
+    def __init__(self, store_path: str, mode="r", verbose: bool = True) -> None:
         assert os.path.exists(store_path), (
             f"Zarr store path does not exist: {store_path}"
         )
         self.store_path = store_path
         self._mode = mode
+        self.verbose = verbose
         self.store = zarr.open(store_path, mode=self._mode)
         self._get_multiscale_metadata()
         self._resolution_level: int = 0
@@ -813,6 +815,82 @@ class OmeZarrArray:
             for i in range(dataset.shape[0]):
                 yield dataset[i]
 
+    def iter_chunks(self) -> Generator[Tuple[Tuple[int, ...], Tuple[slice, ...], np.ndarray], None, None]:
+        """
+        Generator that yields one chunk at a time from the current resolution level.
+
+        Iterates over the full chunk grid of the array (respecting timepoint_lock)
+        and yields each chunk as a tuple of ``(chunk_index, slices, data)``:
+
+        - **chunk_index**: tuple of ints – the N-dimensional chunk coordinate,
+          e.g. ``(0, 1, 2)`` for a 3-D array.
+        - **slices**: tuple of :class:`slice` objects – the array-space region
+          that this chunk covers.  Can be fed straight back into ``__setitem__``.
+        - **data**: :class:`numpy.ndarray` – the chunk's voxel data.
+
+        Yields:
+            Tuple[Tuple[int, ...], Tuple[slice, ...], np.ndarray]
+        """
+        dataset = self._get_dataset()
+        shape = dataset.shape
+        chunks = dataset.chunks
+
+        # When timepoint is locked, we read from the underlying dataset
+        # but present the data without the time dimension.
+        time_idx = None
+        locked_t = None
+        if self._timepoint_lock is not None:
+            time_idx = self._get_axis_index("time")
+            locked_t = self._timepoint_lock
+
+        # Build the effective shape/chunks (what the caller sees).
+        if time_idx is not None:
+            eff_shape = shape[:time_idx] + shape[time_idx + 1 :]
+            eff_chunks = chunks[:time_idx] + chunks[time_idx + 1 :]
+        else:
+            eff_shape = shape
+            eff_chunks = chunks
+
+        ndim = len(eff_shape)
+
+        # Compute the number of chunks along each effective dimension.
+        n_chunks_per_dim = tuple(
+            int(np.ceil(s / c)) for s, c in zip(eff_shape, eff_chunks)
+        )
+
+        # Total number of chunks (for progress tracking if needed)
+        total = int(np.prod(n_chunks_per_dim))
+        if total == 0:
+            return
+
+        # Iterate over every chunk coordinate in row-major (C) order.
+        for flat_idx in range(total):
+            # Convert flat index to N-dimensional chunk coordinate.
+            chunk_idx = []
+            remainder = flat_idx
+            for dim in range(ndim):
+                stride = int(np.prod(n_chunks_per_dim[dim + 1 :])) if dim + 1 < ndim else 1
+                chunk_idx.append(remainder // stride)
+                remainder %= stride
+            chunk_idx = tuple(chunk_idx)
+
+            # Build the slice for each effective dimension.
+            eff_slices = tuple(
+                slice(ci * cs, min((ci + 1) * cs, s))
+                for ci, cs, s in zip(chunk_idx, eff_chunks, eff_shape)
+            )
+
+            # Build the indexing key for the underlying dataset (re-inserting
+            # the locked timepoint if necessary).
+            if time_idx is not None:
+                ds_key = eff_slices[:time_idx] + (locked_t,) + eff_slices[time_idx:]
+            else:
+                ds_key = eff_slices
+
+            data = dataset[ds_key]
+
+            yield chunk_idx, eff_slices, data
+
     def _chunked_z_slices(
         self, t_index: Optional[int] = None, c_index: Optional[int] = None
     ):
@@ -983,3 +1061,209 @@ class OmeZarrArray:
                 x = x[tuple(sl)]
 
         return x
+
+    def to_tiff_stack(
+        self,
+        output_dir: Union[str, Path],
+        basename: Optional[str] = None,
+    ) -> str:
+        """
+        Export the current resolution level as individual 2D TIFF files,
+        one per channel per z-layer, reading only one chunk at a time.
+
+        Files are written to *output_dir* with the naming pattern::
+
+            {basename}_c{C}_z{Z}.tiff
+
+        where *C* is the zero-based channel index and *Z* is the zero-padded
+        z-layer index.
+
+        The method streams data through :meth:`iter_chunks`, so only a single
+        chunk is held in memory at any moment regardless of array size.
+
+        Args:
+            output_dir: Directory where TIFF files will be written.  Created
+                automatically (including parents) if it does not exist.
+            basename: Stem used in every filename.  Defaults to the store
+                directory name (e.g. ``"my_store"`` for ``my_store.zarr``).
+
+        Returns:
+            The absolute path to *output_dir*.
+
+        Raises:
+            ValueError: If the effective array dimensionality after applying
+                ``timepoint_lock`` is not 3-D ``(z, y, x)`` or 4-D
+                ``(c, z, y, x)``.
+
+        Notes:
+            * If the array has a time axis and ``timepoint_lock`` is not set,
+              timepoint 0 is exported and a warning is printed.
+            * Works at the current ``resolution_level``.
+            * The ``slices`` tuple yielded by :meth:`iter_chunks` is used to
+              compute global z/channel indices, so chunk boundaries that span
+              multiple z-layers are handled correctly.
+            * Output TIFFs are **uncompressed** (required by ``tifffile.memmap``).
+
+        .. todo:: Compressed TIFF support
+            Add optional ``compression`` and ``compression_level`` parameters.
+            Approach: use raw ``np.memmap`` scratch files (OS-paged, not heap)
+            to accumulate tiles, then flush each completed plane through
+            ``tifffile.imwrite(compression=...)`` which reads in strips (~1.5 MB
+            each).  Peak Python heap stays at one zarr chunk; temporary disk
+            cost is one z-chunk-range of scratch files (~2 GB for typical data).
+            When ``compression is None``, keep the current direct-memmap path
+            for zero overhead.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if basename is None:
+            basename = Path(self.store_path).stem
+
+        # ---- Handle time axis ------------------------------------------------
+        restore_timepoint = False
+        if self._has_time_axis() and self._timepoint_lock is None:
+            print(
+                "Warning: array has a time axis but no timepoint_lock is set. "
+                "Defaulting to timepoint 0."
+            )
+            self.timepoint_lock = 0
+            restore_timepoint = True
+
+        try:
+            # After timepoint_lock is applied, the effective shape seen by
+            # iter_chunks has the time dimension removed.  Determine axis
+            # layout from the *effective* axis names.
+            eff_axis_names = list(self.axis_names)
+            if self._timepoint_lock is not None:
+                t_idx = self._get_axis_index("time")
+                if t_idx is not None and t_idx < len(eff_axis_names):
+                    eff_axis_names = (
+                        eff_axis_names[:t_idx] + eff_axis_names[t_idx + 1 :]
+                    )
+
+            eff_shape = self.shape  # already has time removed when locked
+
+            # Identify dimension positions in the effective layout.
+            try:
+                z_dim = eff_axis_names.index("z")
+                y_dim = eff_axis_names.index("y")
+                x_dim = eff_axis_names.index("x")
+            except ValueError as exc:
+                raise ValueError(
+                    f"Cannot locate z/y/x axes in effective axis names "
+                    f"{eff_axis_names}. Ensure the array has spatial axes."
+                ) from exc
+
+            c_dim: Optional[int] = None
+            n_channels = 1
+            if "c" in eff_axis_names:
+                c_dim = eff_axis_names.index("c")
+                n_channels = eff_shape[c_dim]
+
+            total_z = eff_shape[z_dim]
+
+            # Zero-pad width so filenames sort lexicographically.
+            z_pad = max(len(str(total_z - 1)), 1)
+            c_pad = max(len(str(n_channels - 1)), 1)
+
+            # ---- Stream chunks and paint tiles into memory-mapped TIFFs ----
+            #
+            # Each TIFF is one full (Y, X) plane created via tifffile.memmap.
+            # The OS page cache manages which 4 KB pages are resident, so
+            # Python heap usage stays at roughly one zarr chunk at a time.
+            #
+            # Memmaps are kept open for the current z-chunk-range.  When
+            # iter_chunks moves to a new z-range (C-order guarantees all YX
+            # tiles for a z-range arrive before the next), we flush and
+            # close the previous batch.
+
+            full_y = eff_shape[y_dim]
+            full_x = eff_shape[x_dim]
+            data_dtype = self.dtype
+
+            # {(global_c, global_z): np.memmap} for the active z-chunk-range
+            open_memmaps: Dict[Tuple[int, int], np.memmap] = {}
+            current_z_range: Optional[Tuple[int, int]] = None
+            files_written = 0
+
+            def _make_fname(gc: int, gz: int) -> str:
+                return (
+                    f"{basename}"
+                    f"_c{str(gc).zfill(c_pad)}"
+                    f"_z{str(gz).zfill(z_pad)}"
+                    f".tiff"
+                )
+
+            def _flush_memmaps() -> None:
+                """Flush and close all active memmaps."""
+                nonlocal files_written
+                for mm in open_memmaps.values():
+                    mm.flush()
+                    del mm
+                files_written += len(open_memmaps)
+                open_memmaps.clear()
+
+            current_chunk = 1
+            for _chunk_idx, slices, data in self.iter_chunks():
+                z_sl: slice = slices[z_dim]
+                z_range = (z_sl.start, z_sl.stop)
+
+                # When the z-range changes, all YX tiles for the previous
+                # range are complete — flush them to disk.
+                if current_z_range is not None and z_range != current_z_range:
+                    _flush_memmaps()
+                current_z_range = z_range
+
+                if c_dim is not None:
+                    c_sl: slice = slices[c_dim]
+                    c_start, c_stop = c_sl.start, c_sl.stop
+                else:
+                    c_start, c_stop = 0, 1
+
+                y_sl: slice = slices[y_dim]
+                x_sl: slice = slices[x_dim]
+
+                for global_c in range(c_start, c_stop):
+                    if self.verbose: print(f"Writing chunks {current_chunk}/{self.total_chunks}")
+                    for global_z in range(z_range[0], z_range[1]):
+                        key = (global_c, global_z)
+
+                        # Lazily create the memmap TIFF on first touch.
+                        if key not in open_memmaps:
+                            fpath = str(output_dir / _make_fname(*key))
+                            if self.verbose: print(f"Creating tiff memmap for {fpath}")
+                            open_memmaps[key] = tifffile.memmap(
+                                fpath,
+                                shape=(full_y, full_x),
+                                dtype=data_dtype,
+                            )
+
+                        # Extract the 2-D tile from chunk data.
+                        local_idx: list = [slice(None)] * data.ndim
+                        local_idx[z_dim] = global_z - z_range[0]
+                        if c_dim is not None:
+                            local_idx[c_dim] = global_c - c_start
+                        tile = data[tuple(local_idx)]
+                        if tile.ndim > 2:
+                            tile = tile.squeeze()
+
+                        # Paint the tile into the correct YX region.
+                        open_memmaps[key][
+                            y_sl.start : y_sl.stop,
+                            x_sl.start : x_sl.stop,
+                        ] = tile
+                current_chunk += 1
+
+            # Flush any remaining memmaps after the last chunk.
+            _flush_memmaps()
+
+            print(
+                f"Wrote {files_written} TIFF files to {output_dir} "
+                f"({n_channels} channel(s), {total_z} z-layer(s))."
+            )
+            return str(output_dir.resolve())
+
+        finally:
+            if restore_timepoint:
+                self._timepoint_lock = None
