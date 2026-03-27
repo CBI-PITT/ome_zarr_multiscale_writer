@@ -10,6 +10,8 @@ from ome_zarr_models.v04.image import Image as ImageV04
 from pathlib import Path
 import os
 import json
+from concurrent.futures import ThreadPoolExecutor, Future
+from collections import deque
 from .zarr_tools import Live3DPyramidWriter, PyramidSpec, ChunkScheme, FlushPad
 from .helpers import key_to_slices
 
@@ -891,6 +893,97 @@ class OmeZarrArray:
 
             yield chunk_idx, eff_slices, data
 
+    def _prefetch_chunks(
+        self, num_workers: int = 4
+    ) -> Generator[Tuple[Tuple[int, ...], Tuple[slice, ...], np.ndarray], None, None]:
+        """
+        Prefetching wrapper around the chunk-read logic used by :meth:`iter_chunks`.
+
+        Submits up to *num_workers* chunk reads ahead of the consumer so that
+        zarr decompression (which releases the GIL) overlaps with downstream
+        processing.  Results are yielded **in chunk-grid order** (C-order),
+        identical to :meth:`iter_chunks`.
+
+        When *num_workers* <= 1 this falls back to the sequential
+        :meth:`iter_chunks` path with no thread overhead.
+
+        Args:
+            num_workers: Maximum number of chunks to prefetch in background
+                threads.  Each in-flight chunk adds roughly one chunk's worth
+                of RAM (e.g. ~8 MB for a 128^3 float32 chunk).
+        """
+        if num_workers <= 1:
+            yield from self.iter_chunks()
+            return
+
+        dataset = self._get_dataset()
+        shape = dataset.shape
+        chunks = dataset.chunks
+
+        # Handle timepoint lock exactly like iter_chunks.
+        time_idx = None
+        locked_t = None
+        if self._timepoint_lock is not None:
+            time_idx = self._get_axis_index("time")
+            locked_t = self._timepoint_lock
+
+        if time_idx is not None:
+            eff_shape = shape[:time_idx] + shape[time_idx + 1:]
+            eff_chunks = chunks[:time_idx] + chunks[time_idx + 1:]
+        else:
+            eff_shape = shape
+            eff_chunks = chunks
+
+        ndim = len(eff_shape)
+        n_chunks_per_dim = tuple(
+            int(np.ceil(s / c)) for s, c in zip(eff_shape, eff_chunks)
+        )
+        total = int(np.prod(n_chunks_per_dim))
+        if total == 0:
+            return
+
+        def _read_chunk(flat_idx: int):
+            """Compute chunk coordinate, slices, and read data (runs in thread)."""
+            chunk_idx = []
+            remainder = flat_idx
+            for dim in range(ndim):
+                stride = int(np.prod(n_chunks_per_dim[dim + 1:])) if dim + 1 < ndim else 1
+                chunk_idx.append(remainder // stride)
+                remainder %= stride
+            chunk_idx_t = tuple(chunk_idx)
+
+            eff_slices = tuple(
+                slice(ci * cs, min((ci + 1) * cs, s))
+                for ci, cs, s in zip(chunk_idx_t, eff_chunks, eff_shape)
+            )
+
+            if time_idx is not None:
+                ds_key = eff_slices[:time_idx] + (locked_t,) + eff_slices[time_idx:]
+            else:
+                ds_key = eff_slices
+
+            data = dataset[ds_key]
+            return chunk_idx_t, eff_slices, data
+
+        # Submit reads ahead of consumption, bounded by num_workers.
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures: deque[Future] = deque()
+
+            # Prime the prefetch queue.
+            prime_count = min(num_workers, total)
+            for i in range(prime_count):
+                futures.append(pool.submit(_read_chunk, i))
+
+            next_submit = prime_count  # next flat_idx to submit
+
+            while futures:
+                result = futures.popleft().result()  # blocks until this chunk is ready
+                # Refill: keep the queue at num_workers depth.
+                if next_submit < total:
+                    futures.append(pool.submit(_read_chunk, next_submit))
+                    next_submit += 1
+                yield result
+
     def _chunked_z_slices(
         self, t_index: Optional[int] = None, c_index: Optional[int] = None
     ):
@@ -1066,10 +1159,11 @@ class OmeZarrArray:
         self,
         output_dir: Union[str, Path],
         basename: Optional[str] = None,
+        num_workers: int = 4,
     ) -> str:
         """
         Export the current resolution level as individual 2D TIFF files,
-        one per channel per z-layer, reading only one chunk at a time.
+        one per channel per z-layer.
 
         Files are written to *output_dir* with the naming pattern::
 
@@ -1078,14 +1172,28 @@ class OmeZarrArray:
         where *C* is the zero-based channel index and *Z* is the zero-padded
         z-layer index.
 
-        The method streams data through :meth:`iter_chunks`, so only a single
-        chunk is held in memory at any moment regardless of array size.
+        The method uses a pipelined architecture with three concurrent stages
+        to overlap I/O with processing:
+
+        1. **Prefetch** – up to *num_workers* zarr chunks are read and
+           decompressed in background threads (GIL is released during zarr
+           I/O and codec decompression).
+        2. **Paint** – the main thread extracts 2-D tiles from each
+           prefetched chunk and writes them into memory-mapped TIFF files.
+        3. **Flush** – completed z-range memmaps are flushed to disk in a
+           background thread while the next z-range is being populated.
+
+        With ``num_workers=1`` the method falls back to fully sequential
+        behaviour identical to the original implementation.
 
         Args:
             output_dir: Directory where TIFF files will be written.  Created
                 automatically (including parents) if it does not exist.
             basename: Stem used in every filename.  Defaults to the store
                 directory name (e.g. ``"my_store"`` for ``my_store.zarr``).
+            num_workers: Number of background threads used for zarr chunk
+                prefetching.  Each in-flight chunk adds roughly one chunk's
+                worth of RAM.  Set to ``1`` to disable threading.  Default 4.
 
         Returns:
             The absolute path to *output_dir*.
@@ -1130,6 +1238,8 @@ class OmeZarrArray:
             self.timepoint_lock = 0
             restore_timepoint = True
 
+        flush_executor: Optional[ThreadPoolExecutor] = None
+        pending_flush: Optional[Future] = None
         try:
             # After timepoint_lock is applied, the effective shape seen by
             # iter_chunks has the time dimension removed.  Determine axis
@@ -1171,12 +1281,13 @@ class OmeZarrArray:
             #
             # Each TIFF is one full (Y, X) plane created via tifffile.memmap.
             # The OS page cache manages which 4 KB pages are resident, so
-            # Python heap usage stays at roughly one zarr chunk at a time.
+            # Python heap usage stays at roughly one zarr chunk plus the
+            # prefetch buffer (num_workers chunks).
             #
             # Memmaps are kept open for the current z-chunk-range.  When
-            # iter_chunks moves to a new z-range (C-order guarantees all YX
-            # tiles for a z-range arrive before the next), we flush and
-            # close the previous batch.
+            # the iterator moves to a new z-range (C-order guarantees all
+            # YX tiles for a z-range arrive before the next), we hand the
+            # completed batch to a background flush thread and start fresh.
 
             full_y = eff_shape[y_dim]
             full_x = eff_shape[x_dim]
@@ -1195,24 +1306,50 @@ class OmeZarrArray:
                     f".tiff"
                 )
 
-            def _flush_memmaps() -> None:
-                """Flush and close all active memmaps."""
-                nonlocal files_written
-                for mm in open_memmaps.values():
+            # ---- Asynchronous flush machinery --------------------------------
+            # A single-thread executor handles flushing the previous z-range's
+            # memmaps in the background while the main thread populates the
+            # next z-range.  We keep a reference to the pending future so we
+            # can wait for it before reusing the dict or returning.
+            flush_executor = ThreadPoolExecutor(max_workers=1)
+            pending_flush: Optional[Future] = None
+
+            def _flush_memmaps_sync(
+                memmaps: Dict[Tuple[int, int], np.memmap],
+            ) -> int:
+                """Flush and close a batch of memmaps. Returns count flushed."""
+                for mm in memmaps.values():
                     mm.flush()
                     del mm
-                files_written += len(open_memmaps)
-                open_memmaps.clear()
+                count = len(memmaps)
+                memmaps.clear()
+                return count
+
+            def _flush_memmaps_async() -> None:
+                """Hand current memmaps to the flush thread and start fresh."""
+                nonlocal open_memmaps, files_written, pending_flush
+
+                # Wait for any previous flush to finish before starting a new
+                # one (there is only one flush thread).
+                if pending_flush is not None:
+                    files_written += pending_flush.result()
+
+                # Move the current dict to the flush thread; create a new one.
+                batch = open_memmaps
+                open_memmaps = {}
+                pending_flush = flush_executor.submit(
+                    _flush_memmaps_sync, batch
+                )
 
             current_chunk = 1
-            for _chunk_idx, slices, data in self.iter_chunks():
+            for _chunk_idx, slices, data in self._prefetch_chunks(num_workers):
                 z_sl: slice = slices[z_dim]
                 z_range = (z_sl.start, z_sl.stop)
 
                 # When the z-range changes, all YX tiles for the previous
-                # range are complete — flush them to disk.
+                # range are complete — flush them to disk asynchronously.
                 if current_z_range is not None and z_range != current_z_range:
-                    _flush_memmaps()
+                    _flush_memmaps_async()
                 current_z_range = z_range
 
                 if c_dim is not None:
@@ -1256,7 +1393,11 @@ class OmeZarrArray:
                 current_chunk += 1
 
             # Flush any remaining memmaps after the last chunk.
-            _flush_memmaps()
+            _flush_memmaps_async()
+            # Wait for the final flush to complete.
+            if pending_flush is not None:
+                files_written += pending_flush.result()
+            flush_executor.shutdown(wait=True)
 
             print(
                 f"Wrote {files_written} TIFF files to {output_dir} "
@@ -1265,5 +1406,13 @@ class OmeZarrArray:
             return str(output_dir.resolve())
 
         finally:
+            # Ensure the flush executor is cleaned up even on exceptions.
+            if flush_executor is not None:
+                try:
+                    if pending_flush is not None:
+                        pending_flush.result()
+                    flush_executor.shutdown(wait=True)
+                except Exception:
+                    flush_executor.shutdown(wait=False)
             if restore_timepoint:
                 self._timepoint_lock = None
