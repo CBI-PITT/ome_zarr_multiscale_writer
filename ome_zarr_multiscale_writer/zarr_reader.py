@@ -894,27 +894,42 @@ class OmeZarrArray:
             yield chunk_idx, eff_slices, data
 
     def _prefetch_chunks(
-        self, num_workers: int = 4
+        self, num_workers: int = 4, prefetch_depth: int = 64
     ) -> Generator[Tuple[Tuple[int, ...], Tuple[slice, ...], np.ndarray], None, None]:
         """
         Prefetching wrapper around the chunk-read logic used by :meth:`iter_chunks`.
 
-        Submits up to *num_workers* chunk reads ahead of the consumer so that
-        zarr decompression (which releases the GIL) overlaps with downstream
-        processing.  Results are yielded **in chunk-grid order** (C-order),
-        identical to :meth:`iter_chunks`.
+        Submits chunk reads to a thread pool so that zarr decompression (which
+        releases the GIL) overlaps with downstream processing.  Up to
+        *prefetch_depth* chunks may be queued ahead of the consumer, spread
+        across *num_workers* threads.  Results are yielded **in chunk-grid
+        order** (C-order), identical to :meth:`iter_chunks`.
+
+        Separating *num_workers* from *prefetch_depth* is important because
+        the consumer (tile painting into memmaps) is much faster than the
+        producer (zarr I/O + decompression).  A shallow buffer equal to the
+        thread count would drain almost instantly, leaving the main thread
+        blocked waiting on the next read.  A deeper buffer lets the thread
+        pool stay saturated and build up a backlog the consumer can burn
+        through without stalling.
 
         When *num_workers* <= 1 this falls back to the sequential
         :meth:`iter_chunks` path with no thread overhead.
 
         Args:
-            num_workers: Maximum number of chunks to prefetch in background
-                threads.  Each in-flight chunk adds roughly one chunk's worth
-                of RAM (e.g. ~8 MB for a 128^3 float32 chunk).
+            num_workers: Number of threads performing concurrent zarr reads.
+                Controls I/O parallelism.
+            prefetch_depth: Maximum number of chunks that may be queued ahead
+                of the consumer.  Each queued chunk adds roughly one chunk's
+                worth of RAM (e.g. ~8 MB for a 128^3 float32 chunk).  Must
+                be >= *num_workers*; clamped automatically if smaller.
         """
         if num_workers <= 1:
             yield from self.iter_chunks()
             return
+
+        # Ensure the buffer is at least as deep as the thread count.
+        prefetch_depth = max(prefetch_depth, num_workers)
 
         dataset = self._get_dataset()
         shape = dataset.shape
@@ -965,12 +980,14 @@ class OmeZarrArray:
             data = dataset[ds_key]
             return chunk_idx_t, eff_slices, data
 
-        # Submit reads ahead of consumption, bounded by num_workers.
+        # Submit reads ahead of consumption, bounded by prefetch_depth.
+        # The thread pool has num_workers threads, but we allow up to
+        # prefetch_depth futures to be queued (pending + in-flight).
         with ThreadPoolExecutor(max_workers=num_workers) as pool:
             futures: deque[Future] = deque()
 
-            # Prime the prefetch queue.
-            prime_count = min(num_workers, total)
+            # Prime the prefetch queue to full depth.
+            prime_count = min(prefetch_depth, total)
             for i in range(prime_count):
                 futures.append(pool.submit(_read_chunk, i))
 
@@ -978,7 +995,7 @@ class OmeZarrArray:
 
             while futures:
                 result = futures.popleft().result()  # blocks until this chunk is ready
-                # Refill: keep the queue at num_workers depth.
+                # Refill: keep the queue at prefetch_depth.
                 if next_submit < total:
                     futures.append(pool.submit(_read_chunk, next_submit))
                     next_submit += 1
@@ -1160,6 +1177,7 @@ class OmeZarrArray:
         output_dir: Union[str, Path],
         basename: Optional[str] = None,
         num_workers: int = 4,
+        prefetch_depth: int = 64,
     ) -> str:
         """
         Export the current resolution level as individual 2D TIFF files,
@@ -1175,13 +1193,19 @@ class OmeZarrArray:
         The method uses a pipelined architecture with three concurrent stages
         to overlap I/O with processing:
 
-        1. **Prefetch** – up to *num_workers* zarr chunks are read and
-           decompressed in background threads (GIL is released during zarr
-           I/O and codec decompression).
+        1. **Prefetch** – *num_workers* threads read and decompress zarr
+           chunks into a buffer of up to *prefetch_depth* chunks (GIL is
+           released during zarr I/O and codec decompression).
         2. **Paint** – the main thread extracts 2-D tiles from each
            prefetched chunk and writes them into memory-mapped TIFF files.
         3. **Flush** – completed z-range memmaps are flushed to disk in a
            background thread while the next z-range is being populated.
+
+        Because painting (step 2) is much faster than reading (step 1), a
+        shallow prefetch buffer drains almost instantly, causing the main
+        thread to stall waiting for the next read.  Set *prefetch_depth*
+        large enough so the thread pool can stay saturated and build up a
+        backlog the consumer can burn through without pausing.
 
         With ``num_workers=1`` the method falls back to fully sequential
         behaviour identical to the original implementation.
@@ -1191,9 +1215,13 @@ class OmeZarrArray:
                 automatically (including parents) if it does not exist.
             basename: Stem used in every filename.  Defaults to the store
                 directory name (e.g. ``"my_store"`` for ``my_store.zarr``).
-            num_workers: Number of background threads used for zarr chunk
-                prefetching.  Each in-flight chunk adds roughly one chunk's
-                worth of RAM.  Set to ``1`` to disable threading.  Default 4.
+            num_workers: Number of background threads performing concurrent
+                zarr reads.  Controls I/O parallelism.  Set to ``1`` to
+                disable threading.  Default 4.
+            prefetch_depth: Maximum number of chunks that may be queued ahead
+                of the consumer.  Each queued chunk adds roughly one chunk's
+                worth of RAM (e.g. ~8 MB for a 128^3 float32 chunk).
+                Clamped to at least *num_workers*.  Default 64.
 
         Returns:
             The absolute path to *output_dir*.
@@ -1342,7 +1370,7 @@ class OmeZarrArray:
                 )
 
             current_chunk = 1
-            for _chunk_idx, slices, data in self._prefetch_chunks(num_workers):
+            for _chunk_idx, slices, data in self._prefetch_chunks(num_workers, prefetch_depth):
                 z_sl: slice = slices[z_dim]
                 z_range = (z_sl.start, z_sl.stop)
 
