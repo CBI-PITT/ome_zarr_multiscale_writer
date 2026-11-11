@@ -307,8 +307,13 @@ def init_ome_zarr(
                 "dtype": "uint16",
             }
             if compressor is not None:
-                # v3: list of codecs
-                create_kwargs["compressors"] = [compressor]
+                # v3: list of codecs. A reader-sourced compressor may be a
+                # tuple of codecs (zarr 3's ``compressors`` property returns a
+                # tuple), so normalize before wrapping in a list.
+                if isinstance(compressor, (tuple, list)):
+                    create_kwargs["compressors"] = list(compressor)
+                else:
+                    create_kwargs["compressors"] = [compressor]
             if shards_l is not None:
                 # v3: inner shard (must divide chunks)
                 create_kwargs["shards"] = shards_l
