@@ -13,8 +13,17 @@ from enum import Enum
 import multiprocessing as mp
 from multiprocessing import shared_memory
 
+import sys
+
+script_dir = Path(__file__).resolve().parent
+script_dir_parent = Path(__file__).resolve().parent.parent
+
+if str(script_dir) not in sys.path:
+    sys.path.insert(0, str(script_dir))
+    sys.path.insert(0, str(script_dir_parent))
+
 # Local imports
-from .helpers import (
+from helpers import (
     ceil_div,
     compute_xy_only_levels,
     ds2_mean_uint16,
@@ -245,7 +254,7 @@ def init_ome_zarr(
 ):
     # Map OME-NGFF version to Zarr store version
     zarr_version = 2 if ome_version == "0.4" else 3
-    root = zarr.open_group(path, mode="a", zarr_version=zarr_version)
+    root = zarr.open_group(path, mode="a", zarr_format=zarr_version)
     arrs = []
 
     # Determine if we're dealing with 5D data (t,c,z,y,x) or legacy 3D (z,y,x)
@@ -510,6 +519,12 @@ class Live3DPyramidWriter:
         self.lock = (
             threading.Lock()
         )  # sequences z-indices & buffers (single writer to RAM)
+        # Per-(level, t, c) write locks. Zarr sharded stores perform a
+        # read-modify-write per shard file, which silently loses chunk updates
+        # when two concurrent writes touch the same shard file. Writes into one
+        # (level, t, c) slab are therefore serialized; different levels and
+        # different (t, c) slabs touch disjoint shard files and stay parallel.
+        self._write_locks = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
         # Allow at most ~2 chunks per worker in flight (tweak as you like)
         self.max_inflight_chunks = max_inflight_chunks or (self.max_workers * 40)
@@ -601,6 +616,9 @@ class Live3DPyramidWriter:
             # flush odd Z-pair tails at levels >= 1
             self._flush_pair_tails_all_the_way()
 
+            # Snapshot true plane counts now; later bookkeeping must not shrink them
+            z_counts_final = list(self.z_counts)
+
             # Flush any partially filled chunks w/o RMW by padding to full chunk size
             for l in range(self.levels):
                 if self.buffers[l] is not None and self.buf_fill[l] > 0:
@@ -623,7 +641,7 @@ class Live3DPyramidWriter:
                 a.resize((a.shape[0], a.shape[1], max_z_count, a.shape[3], a.shape[4]))
             else:
                 # 3D arrays: (z, y, x) -> traditional resize
-                a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
+                a.resize((z_counts_final[l], a.shape[1], a.shape[2]))
 
     # inside class Live3DPyramidWriter
 
@@ -645,6 +663,7 @@ class Live3DPyramidWriter:
 
         with self.lock:
             self._flush_pair_tails_all_the_way()
+            z_counts_final = list(self.z_counts)
             for l in range(self.levels):
                 if self.buffers[l] is not None and self.buf_fill[l] > 0:
                     self._pad_and_flush_partial_chunk(l)
@@ -668,7 +687,7 @@ class Live3DPyramidWriter:
                 a.resize((a.shape[0], a.shape[1], max_z_count, a.shape[3], a.shape[4]))
             else:
                 # 3D arrays: (z, y, x) -> traditional resize
-                a.resize((self.z_counts[l], a.shape[1], a.shape[2]))
+                a.resize((z_counts_final[l], a.shape[1], a.shape[2]))
 
         # optional: mark completion for external watchers
         try:
@@ -697,9 +716,10 @@ class Live3DPyramidWriter:
                         buf = pair_buf_list[lvl]
                         if buf is None:
                             continue
-                        if self.flush_pad == FlushPad.DUPLICATE_LAST:
+                        fp = FlushPad(getattr(self.flush_pad, "value", self.flush_pad))
+                        if fp == FlushPad.DUPLICATE_LAST:
                             tail = dsZ2_mean_uint16(buf, buf)
-                        elif self.flush_pad == FlushPad.ZEROS:
+                        elif fp == FlushPad.ZEROS:
                             tail = dsZ2_mean_uint16(
                                 buf, np.zeros_like(buf, dtype=np.uint16)
                             )
@@ -726,9 +746,10 @@ class Live3DPyramidWriter:
                     buf = self._pair_buf[lvl]
                     if buf is None:
                         continue
-                    if self.flush_pad == FlushPad.DUPLICATE_LAST:
+                    fp = FlushPad(getattr(self.flush_pad, "value", self.flush_pad))
+                    if fp == FlushPad.DUPLICATE_LAST:
                         tail = dsZ2_mean_uint16(buf, buf)
-                    elif self.flush_pad == FlushPad.ZEROS:
+                    elif fp == FlushPad.ZEROS:
                         tail = dsZ2_mean_uint16(
                             buf, np.zeros_like(buf, dtype=np.uint16)
                         )
@@ -775,34 +796,39 @@ class Live3DPyramidWriter:
         if (
             self.max_inflight_chunks == 1 and self.max_inflight_chunks == 1
         ):  # Helps with single threaded debugging
-            if buf3d.ndim == 5:  # 5D data
-                self.arrs[level][t_index, c_index, z0 : z0 + buf3d.shape[2], :, :] = (
-                    buf3d[0, 0, :, :, :]
-                )
-            else:  # 3D data
-                self.arrs[level][z0 : z0 + buf3d.shape[0], :, :] = buf3d
+            self._write_chunk_slice(level, z0, buf3d, t_index, c_index)
         else:
             self._inflight_sem.acquire()
             fut = self.pool.submit(
                 self._write_chunk_slice,
-                self.arrs[level],
+                level,
                 z0,
                 buf3d,
                 t_index,
                 c_index,
-                self.is_5d,
             )
             # Release the slot when done (and drop ref to the future immediately)
             fut.add_done_callback(lambda _f: self._inflight_sem.release())
 
-    @staticmethod
-    def _write_chunk_slice(arr, z0, buf3d, t_index, c_index, is_5d):
-        if is_5d:
-            # 5D: (t, c, z, y, x) -> write to specific t,c slice
-            arr[t_index, c_index, z0 : z0 + buf3d.shape[2], :, :] = buf3d[0, 0, :, :, :]
-        else:
-            # 3D: (z, y, x) -> traditional write
-            arr[z0 : z0 + buf3d.shape[0], :, :] = buf3d  # contiguous, aligned write
+    def _write_chunk_slice(self, level, z0, buf3d, t_index, c_index):
+        # Serialize writes per (level, t, c) slab: zarr sharded stores perform a
+        # read-modify-write per shard file and lose chunk updates when two
+        # concurrent writes touch the same shard file. Different levels and
+        # different (t, c) slabs touch disjoint shard files and stay parallel.
+        wlock = self._write_locks.setdefault(
+            (level, t_index, c_index), threading.Lock()
+        )
+        with wlock:
+            if self.is_5d:
+                # 5D: (t, c, z, y, x) -> write to specific t,c slice
+                self.arrs[level][
+                    t_index, c_index, z0 : z0 + buf3d.shape[2], :, :
+                ] = buf3d[0, 0, :, :, :]
+            else:
+                # 3D: (z, y, x) -> traditional write
+                self.arrs[level][z0 : z0 + buf3d.shape[0], :, :] = (
+                    buf3d  # contiguous, aligned write
+                )
 
     def _ensure_active_buffer(
         self, level: int, start_z: int, t_index: int = 0, c_index: int = 0
@@ -879,11 +905,12 @@ class Live3DPyramidWriter:
         if fill == 0:
             return
         buf = self.buffers[level]
-        if self.flush_pad == FlushPad.DUPLICATE_LAST:
+        fp = FlushPad(getattr(self.flush_pad, "value", self.flush_pad))
+        if fp == FlushPad.DUPLICATE_LAST:
             last = buf[fill - 1 : fill, :, :]
             repeat = np.repeat(last, zc - fill, axis=0)
             padded = np.concatenate([buf[:fill], repeat], axis=0)
-        elif self.flush_pad == FlushPad.ZEROS:
+        elif fp == FlushPad.ZEROS:
             pad = np.zeros((zc - fill, buf.shape[1], buf.shape[2]), dtype=np.uint16)
             padded = np.concatenate([buf[:fill], pad], axis=0)
         else:  # DROP
